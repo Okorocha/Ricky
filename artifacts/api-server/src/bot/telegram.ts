@@ -26,6 +26,21 @@ function markZoneCooldown(zoneKey: string): void {
   zoneCooldowns.set(zoneKey, Date.now());
 }
 
+// ── DB-level cooldown check (survives server restarts) ────────────────────────
+async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
+  try {
+    const cutoff = new Date(Date.now() - ZONE_COOLDOWN_MS);
+    const recent = await db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(and(eq(signals.zoneKey, zoneKey), gte(signals.createdAt, cutoff)))
+      .limit(1);
+    return recent.length > 0;
+  } catch {
+    return false; // fail open — let in-memory cooldown handle it
+  }
+}
+
 // ── Price history for multi-tick confirmation ─────────────────────────────────
 interface PriceTick {
   price: number;
@@ -676,7 +691,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const signalsToSave: Array<{ direction: string; zoneKey: string }> = [];
 
   for (const zone of activeZones) {
-    if (isZoneOnCooldown(zone.key)) { cooldownRejected++; continue; }
+    if (isZoneOnCooldown(zone.key) || await isZoneOnCooldownDB(zone.key)) { cooldownRejected++; continue; }
     if (blockedZoneKeys.has(zone.key)) { constraintRejected++; continue; }
 
     const dir = zone.type.includes("LONG") ? "LONG" : "SHORT";
@@ -901,7 +916,7 @@ export async function scanFVGs(
     if (!inGap) continue;
 
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
-    if (isZoneOnCooldown(zoneKey)) continue;
+    if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     // Dynamic SL/TP based on gap size
     const gapSize = fvg.high - fvg.low;

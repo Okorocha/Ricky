@@ -4,7 +4,7 @@ import { useState, useMemo } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Loader2, TrendingUp, Activity, Shield, Bell, Play, Zap, History } from "lucide-react";
+import { Loader2, TrendingUp, Activity, Shield, Bell, Play, Zap, History, AlertTriangle, ChevronDown, BarChart2, Target } from "lucide-react";
 import { toast } from "sonner";
 
 function PriceDisplay({ price, spread, source }: { price: number; spread: number; source: string }) {
@@ -26,7 +26,25 @@ function PriceDisplay({ price, spread, source }: { price: number; spread: number
   );
 }
 
-function StatBox({ label, value, className }: { label: string; value: number; className?: string }) {
+function PriceError() {
+  return (
+    <Card className="border-rose-500/20 bg-gradient-to-br from-[#0a0f1a] via-[#0d1525] to-[#0a0f1a]">
+      <CardContent className="p-5">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-full bg-rose-500/10 border border-rose-500/20 flex items-center justify-center flex-shrink-0">
+            <AlertTriangle className="w-4 h-4 text-rose-400" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-rose-400">Price fetch failed</p>
+            <p className="text-[11px] text-slate-600 mt-0.5">Twelve Data unavailable — retrying every 15s</p>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function StatBox({ label, value, className }: { label: string; value: number | string; className?: string }) {
   return (
     <div className="text-center p-2 rounded-lg bg-slate-900/40">
       <p className={`text-xl font-bold tabular-nums ${className}`}>{value}</p>
@@ -65,8 +83,37 @@ function SignalCard({ signal }: { signal: any }) {
       <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[11px]">
         <span className="text-slate-500">Entry</span><span className="text-amber-300 font-mono">${signal.entry.toFixed(2)}</span>
         <span className="text-slate-500">SL</span><span className="text-rose-400 font-mono">${signal.sl.toFixed(2)}</span>
-        <span className="text-slate-500">TP1–TP3</span><span className="text-emerald-400 font-mono">${signal.tp1.toFixed(2)} · ${signal.tp3.toFixed(2)}</span>
+        <span className="text-slate-500">TP1</span><span className="text-emerald-400 font-mono">${signal.tp1.toFixed(2)}</span>
+        <span className="text-slate-500">TP2</span><span className="text-emerald-400 font-mono">${signal.tp2.toFixed(2)}</span>
+        <span className="text-slate-500">TP3</span><span className="text-emerald-400 font-mono">${signal.tp3.toFixed(2)}</span>
       </div>
+    </div>
+  );
+}
+
+function SetupCard({ setup }: { setup: any }) {
+  const isLong = setup.direction.includes("LONG");
+  return (
+    <div className="p-3 rounded-lg border border-orange-500/20 bg-slate-900/60 hover:border-orange-500/40 transition-colors">
+      <div className="flex items-center justify-between mb-1.5">
+        <div className="flex items-center gap-2">
+          <span className={`text-sm font-bold ${isLong ? "text-emerald-400" : "text-rose-400"}`}>
+            {isLong ? "LONG" : "SHORT"}
+          </span>
+          {statusBadge(setup.status)}
+        </div>
+        <span className="text-[10px] text-slate-600">{new Date(setup.detectedAt).toLocaleTimeString()}</span>
+      </div>
+      <p className="text-[11px] text-slate-500 mb-1.5">{setup.zoneLabel}</p>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-[11px]">
+        <span className="text-slate-500">Entry</span><span className="text-amber-300 font-mono">${setup.entry.toFixed(2)}</span>
+        <span className="text-slate-500">SL</span><span className="text-rose-400 font-mono">${setup.sl.toFixed(2)}</span>
+        <span className="text-slate-500">TP1</span><span className="text-emerald-400 font-mono">${setup.tp1.toFixed(2)}</span>
+        <span className="text-slate-500">TP3</span><span className="text-emerald-400 font-mono">${setup.tp3.toFixed(2)}</span>
+      </div>
+      {setup.session && (
+        <p className="text-[10px] text-slate-600 mt-1.5">{setup.session} · {setup.priority}</p>
+      )}
     </div>
   );
 }
@@ -135,6 +182,7 @@ export default function Home() {
   const { isAuthenticated } = useAuth();
   const [manualScanning, setManualScanning] = useState(false);
   const [manualAlive, setManualAlive] = useState(false);
+  const [historyLimit, setHistoryLimit] = useState(10);
 
   const priceQuery = trpc.bot.price.useQuery(undefined, { refetchInterval: 15000 });
   const signalsQuery = trpc.bot.signals.useQuery(undefined, { refetchInterval: 30000 });
@@ -142,6 +190,7 @@ export default function Home() {
   const tradeHistoryQuery = trpc.bot.tradeHistory.useQuery(undefined, { refetchInterval: 30000 });
   const logQuery = trpc.bot.telegramLog.useQuery(undefined, { refetchInterval: 15000 });
   const setupsQuery = trpc.bot.activeSetups.useQuery(undefined, { refetchInterval: 30000 });
+  const statsQuery = trpc.bot.stats.useQuery(undefined, { refetchInterval: 60000 });
 
   const scanMutation = trpc.bot.triggerScan.useMutation({
     onSuccess: (data) => {
@@ -172,12 +221,24 @@ export default function Home() {
   const tradeHistory = tradeHistoryQuery.data || [];
   const logs = logQuery.data || [];
   const setups = setupsQuery.data || [];
+  const stats = statsQuery.data;
 
   const recentSignals = useMemo(() => signals.slice(0, 8), [signals]);
   const todaySignals = useMemo(() => signals.filter((s: any) => new Date(s.createdAt).toDateString() === new Date().toDateString()).length, [signals]);
 
   // Closed trades only for history section
   const closedTrades = useMemo(() => tradeHistory.filter((t: any) => t.closed), [tradeHistory]);
+
+  // Win rate & P&L summary
+  const tradeStats = useMemo(() => {
+    if (closedTrades.length === 0) return null;
+    const wins = closedTrades.filter((t: any) => t.tp1Hit || t.tp2Hit || t.tp3Hit).length;
+    const losses = closedTrades.filter((t: any) => t.slHit && !t.tp1Hit).length;
+    const total = wins + losses;
+    const winRate = total > 0 ? Math.round((wins / total) * 100) : 0;
+    const tp3s = closedTrades.filter((t: any) => t.tp3Hit).length;
+    return { wins, losses, total, winRate, tp3s };
+  }, [closedTrades]);
 
   return (
     <div className="min-h-screen bg-[#060a12] text-slate-100">
@@ -226,7 +287,11 @@ export default function Home() {
         {/* Price + Stats row */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <div className="md:col-span-2">
-            {price ? <PriceDisplay price={price.price} spread={price.spread} source={price.source} /> : (
+            {priceQuery.isError ? (
+              <PriceError />
+            ) : price ? (
+              <PriceDisplay price={price.price} spread={price.spread} source={price.source} />
+            ) : (
               <Card className="bg-[#0a0f1a] border-slate-800"><CardContent className="p-5"><Loader2 className="w-5 h-5 text-slate-700 animate-spin" /></CardContent></Card>
             )}
           </div>
@@ -237,11 +302,36 @@ export default function Home() {
                 <StatBox label="Today" value={todaySignals} className="text-amber-400" />
                 <StatBox label="Active" value={trades.length} className="text-emerald-400" />
                 <StatBox label="Pending" value={setups.length} className="text-orange-400" />
-                <StatBox label="Closed" value={closedTrades.length} className="text-white" />
+                <StatBox label="Msgs" value={stats?.messages ?? "–"} className="text-sky-400" />
               </div>
             </CardContent>
           </Card>
         </div>
+
+        {/* Win Rate & P&L Summary */}
+        {tradeStats && (
+          <Card className="bg-[#0a0f1a] border-slate-800">
+            <CardHeader className="pb-1.5"><CardTitle className="text-[11px] text-slate-500 flex items-center gap-1.5"><BarChart2 className="w-3.5 h-3.5 text-amber-400" /> Performance</CardTitle></CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-4 gap-2">
+                <StatBox label="Win Rate" value={`${tradeStats.winRate}%`} className={tradeStats.winRate >= 50 ? "text-emerald-400" : "text-rose-400"} />
+                <StatBox label="Wins" value={tradeStats.wins} className="text-emerald-400" />
+                <StatBox label="Losses" value={tradeStats.losses} className="text-rose-400" />
+                <StatBox label="TP3 Hits" value={tradeStats.tp3s} className="text-amber-400" />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Active Setups */}
+        {setups.length > 0 && (
+          <div>
+            <h2 className="text-xs font-semibold text-slate-400 mb-2.5 flex items-center gap-1.5"><Target className="w-3.5 h-3.5 text-orange-400" /> Active Setups <span className="text-[10px] text-slate-600">({setups.length})</span></h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+              {setups.map((s: any) => <SetupCard key={s.id} setup={s} />)}
+            </div>
+          </div>
+        )}
 
         {/* Active Trades */}
         {trades.length > 0 && (
@@ -270,10 +360,19 @@ export default function Home() {
         {/* Trade History */}
         {closedTrades.length > 0 && (
           <div>
-            <h2 className="text-xs font-semibold text-slate-400 mb-2.5 flex items-center gap-1.5"><History className="w-3.5 h-3.5 text-slate-400" /> Trade History</h2>
+            <h2 className="text-xs font-semibold text-slate-400 mb-2.5 flex items-center gap-1.5"><History className="w-3.5 h-3.5 text-slate-400" /> Trade History <span className="text-[10px] text-slate-600">({closedTrades.length})</span></h2>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-              {closedTrades.slice(0, 10).map((t: any) => <TradeCard key={t.id} trade={t} />)}
+              {closedTrades.slice(0, historyLimit).map((t: any) => <TradeCard key={t.id} trade={t} />)}
             </div>
+            {closedTrades.length > historyLimit && (
+              <button
+                onClick={() => setHistoryLimit(prev => prev + 10)}
+                className="mt-3 w-full flex items-center justify-center gap-1.5 py-2 text-[11px] text-slate-500 hover:text-slate-300 border border-slate-800 hover:border-slate-700 rounded-lg transition-colors"
+              >
+                <ChevronDown className="w-3.5 h-3.5" />
+                Show more ({closedTrades.length - historyLimit} remaining)
+              </button>
+            )}
           </div>
         )}
 
