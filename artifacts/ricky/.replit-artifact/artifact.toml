@@ -1,0 +1,27 @@
+kind = "web"
+previewPath = "/"
+title = "XAUUSD Trading Bot"
+version = "1.0.0"
+id = "artifacts/ricky"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 18717
+
+[services.development]
+run = "pnpm --filter @workspace/ricky run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/ricky", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/ricky/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "18717"
+BASE_PATH = "/"

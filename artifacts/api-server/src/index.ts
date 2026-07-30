@@ -1,5 +1,6 @@
 import app from "./app";
 import { logger } from "./lib/logger";
+import { startTradeMonitoring, startTelegramPolling, startAutoScan } from "./bot/telegram";
 
 const rawPort = process.env["PORT"];
 
@@ -22,4 +23,14 @@ app.listen(port, (err) => {
   }
 
   logger.info({ port }, "Server listening");
+
+  // Start fast in-process trade monitor (always — catches TP/SL in near real-time)
+  if (process.env.TELEGRAM_TOKEN) {
+    startAutoScan();
+    startTradeMonitoring();
+    startTelegramPolling();
+    logger.info("Telegram bot, auto-scan, and trade monitoring started");
+  } else {
+    logger.warn("TELEGRAM_TOKEN not set — bot and trade monitoring disabled");
+  }
 });
