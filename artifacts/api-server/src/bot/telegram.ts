@@ -535,17 +535,16 @@ export function formatSignal(
   currentPrice: number, session: string, priority: string,
   reason: string, status: string
 ): string {
-  const arrow = direction.includes("LONG") ? "🟢" : "🔴";
-  const isEntering = status === "ENTERING";
-  const action = isEntering ? "SETUP FORMING" : "ENTER NOW";
-  const urgency = isEntering ? "⚠️" : "🚨";
+  const isLong = direction.includes("LONG");
+  const arrow = isLong ? "🟢" : "🔴";
+  const action = isLong ? "BUY NOW" : "SELL NOW";
   const sessionShort = session.split(" ")[0];
 
-  return `<b>${urgency} ${arrow} XAU/USD — ${action}</b>
-<b>Direction:</b> ${arrow} ${direction} | ${sessionShort} (${priority})
-<b>Zone:</b> ${zoneLabel}
+  return `<b>🚨 ${arrow} XAU/USD — ${action}</b>
+<b>Zone:</b> ${zoneLabel} (${status === "SWEEP" ? "Liquidity Sweep" : "At Level"})
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : "\nReply <b>IN</b> to confirm trade"}`;
+<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+<b>Session:</b> ${sessionShort} (${priority})`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -592,18 +591,31 @@ async function getTradeConstraints(): Promise<{
 }
 
 // ── Calculate TP/SL from zone level ─────────────────────────────────────────
+// SL minimum 5.0 pts — gold spread alone can be 0.5-2 pts, so anything
+// tighter than 5 pts gets taken out before price even moves.
 function calculateLevels(
   direction: "LONG" | "SHORT",
   zonePrice: number,
-  spread: number
+  spread: number,
+  recentCandles: OHLCCandle[] = []
 ): { entry: number; sl: number; slDistance: number; tp1: number; tp2: number; tp3: number } {
-  const slBuffer = Math.max(spread * 2, 1.5);
+  // Dynamic ATR-based buffer from recent candle ranges
+  let atrBuffer = 0;
+  if (recentCandles.length >= 5) {
+    const last5 = recentCandles.slice(-5);
+    const avgRange = last5.reduce((a, c) => a + (c.high - c.low), 0) / last5.length;
+    atrBuffer = avgRange * 0.6; // 60% of avg candle range
+  }
+  // Hard minimum: 5 pts. Covers worst-case gold spread + noise.
+  const slBuffer = Math.max(spread * 3, atrBuffer, 5.0);
   const isLong = direction === "LONG";
 
-  const entry = isLong ? zonePrice + spread * 0.3 : zonePrice - spread * 0.3;
+  // Entry just inside the zone (don't chase — enter at zone edge)
+  const entry = isLong ? zonePrice + spread * 0.2 : zonePrice - spread * 0.2;
   const sl = isLong ? zonePrice - slBuffer : zonePrice + slBuffer;
   const slDistance = Math.abs(entry - sl);
 
+  // R:R 1.5/2.5/4.0 — quality setups only, let runners run
   const tp1 = isLong ? entry + slDistance * 1.5 : entry - slDistance * 1.5;
   const tp2 = isLong ? entry + slDistance * 2.5 : entry - slDistance * 2.5;
   const tp3 = isLong ? entry + slDistance * 4.0 : entry - slDistance * 4.0;
@@ -612,6 +624,9 @@ function calculateLevels(
 }
 
 // ── Scan Zones ───────────────────────────────────────────────────────────────
+// Only fires on AT_LEVEL and SWEEP — never on ENTERING.
+// Emits at most ONE signal per scan (the closest, strongest setup).
+// Signal goes directly to activeTrades for TP/SL monitoring — no confirmation step.
 export async function scanZones(priceData: { price: number; bid: number; ask: number; spread: number; source: string }): Promise<ScanResult> {
   const price = priceData.price;
   const spread = priceData.spread;
@@ -622,32 +637,23 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason: `News blackout — ${newsMsg}` };
   }
 
-  // Refresh levels if stale (non-blocking on failure — uses last known levels)
   await ensureLevelsRefreshed();
-
-  // Fetch real 1-min candles once for the whole scan
   const recentCandles = await getRecentMinuteCandles();
-
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
   const marketStructure = await analyzeMarketStructure(priceData);
   const { session, priority } = getSessionInfo();
 
-  // Rejection counters for reporting
-  let htfRejected = 0;
   let cooldownRejected = 0;
   let constraintRejected = 0;
   let candleRejected = 0;
 
-  // Determine active zones near price
-  const activeZones: Array<{
-    key: string;
-    label: string;
-    tier: string;
-    price: number;
-    type: "LONG" | "SHORT";
-    dist: number;
-    status: string;
-  }> = [];
+  // Collect qualified setups — ENTERING filtered out entirely
+  type QualifiedZone = {
+    key: string; label: string; tier: string; price: number;
+    type: "LONG" | "SHORT"; dist: number; status: string;
+    candle: CandleSignal;
+  };
+  const qualified: QualifiedZone[] = [];
 
   for (const [key, level] of Object.entries(LEVELS)) {
     const dist = Math.abs(price - level.price);
@@ -655,148 +661,74 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     const isSupport = key.startsWith("s");
     const direction: "LONG" | "SHORT" = isSupport ? "LONG" : "SHORT";
 
-    // Determine zone status
+    // Only fire when price is AT the level or sweeping through it
     let status: string | null = null;
-    if (dist <= thresh.sweep) {
-      status = "SWEEP";
-    } else if (dist <= thresh.atLevel) {
-      status = "AT_LEVEL";
-    } else if (dist <= thresh.entering) {
-      status = "ENTERING";
-    }
+    if (dist <= thresh.sweep)   status = "SWEEP";
+    else if (dist <= thresh.atLevel) status = "AT_LEVEL";
+    // ENTERING is intentionally skipped — those signals arrive before price
+    // has confirmed anything and most of them get cancelled.
 
     if (!status) continue;
 
-    // HTF bias filter: only gate ENTERING setups — AT_LEVEL and SWEEP are
-    // immediate price-action setups and should not be blocked by HTF bias.
-    const htf = marketStructure.htfBias;
-    if (htf !== "neutral" && status === "ENTERING") {
-      if (direction === "LONG" && htf === "bearish") { htfRejected++; continue; }
-      if (direction === "SHORT" && htf === "bullish") { htfRejected++; continue; }
-    }
-
-    activeZones.push({ key, label: level.label, tier: level.tier, price: level.price, type: direction, dist, status });
-  }
-
-  if (activeZones.length === 0) {
-    const reason = htfRejected > 0
-      ? "HTF bias mismatch — price not at a level aligned with trend"
-      : "Price not at valid support/resistance";
-    return { setupFound: false, count: 0, reason };
-  }
-
-  // Sort by distance (closest first)
-  activeZones.sort((a, b) => a.dist - b.dist);
-
-  const signalsToSave: Array<{ direction: string; zoneKey: string }> = [];
-
-  for (const zone of activeZones) {
-    if (isZoneOnCooldown(zone.key) || await isZoneOnCooldownDB(zone.key)) { cooldownRejected++; continue; }
-    if (blockedZoneKeys.has(zone.key)) { constraintRejected++; continue; }
-
-    const dir = zone.type.includes("LONG") ? "LONG" : "SHORT";
+    if (isZoneOnCooldown(key) || await isZoneOnCooldownDB(key)) { cooldownRejected++; continue; }
+    if (blockedZoneKeys.has(key)) { constraintRejected++; continue; }
+    const dir = direction.includes("LONG") ? "LONG" : "SHORT";
     if (blockedDirections.has(dir)) { constraintRejected++; continue; }
 
-    const candle = detectCandleSignal(price, spread, zone.dist, zone.status, zone.type, recentCandles);
+    const candle = detectCandleSignal(price, spread, dist, status, direction, recentCandles);
     if (!candle.confirmed) { candleRejected++; continue; }
 
-    const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread);
-
-    const reasons: Record<string, string> = {
-      "ENTERING": `Price entering ${zone.label} — ${candle.pattern} setup (${candle.strength})`,
-      "AT_LEVEL": `Price AT ${zone.label} — ${candle.pattern} signal (${candle.strength})`,
-      "SWEEP": `Liquidity sweep at ${zone.label} — reversal setup (${candle.strength})`,
-    };
-
-    const biasNote = marketStructure.htfBias !== "neutral"
-      ? ` | HTF Bias: ${marketStructure.htfBias}`
-      : "";
-    const fullReason = (reasons[zone.status] || "Setup detected at key level.") + biasNote;
-
-    signalsToSave.push({ direction: zone.type, zoneKey: zone.key });
-    markZoneCooldown(zone.key);
-
-    try {
-      await db.insert(activeSetups).values({
-        zoneKey: zone.key,
-        direction: zone.type,
-        zoneLabel: zone.label,
-        zoneTier: zone.tier,
-        entry,
-        sl,
-        slDistance,
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-        session,
-        priority,
-      });
-      await db.insert(signals).values({
-        direction: zone.type,
-        zoneLabel: zone.label,
-        zoneTier: zone.tier,
-        entry,
-        sl,
-        slDistance,
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        session,
-        priority,
-        reason: fullReason,
-        status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-        zoneKey: zone.key,
-      });
-    } catch (err) {
-      console.error("[Bot] DB insert error:", err);
-    }
-
-    const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status);
-    await sendTelegram(msg, "signal");
+    qualified.push({ key, label: level.label, tier: level.tier, price: level.price, type: direction, dist, status, candle });
   }
 
-  // Direction shift alert
-  if (signalsToSave.length > 0) {
-    try {
-      const lastTrade = await db.select().from(activeTrades).orderBy(desc(activeTrades.confirmedAt)).limit(1);
-      if (lastTrade.length > 0) {
-        const lastTradeDir = lastTrade[0]!.direction;
-        const newDir = signalsToSave[0]!.direction;
-        if (
-          (lastTradeDir.includes("LONG") && newDir.includes("SHORT")) ||
-          (lastTradeDir.includes("SHORT") && newDir.includes("LONG"))
-        ) {
-          await sendTelegram(
-            `<b>⚠️ XAU/USD — DIRECTION SHIFT ALERT</b>\n━━━━━━━━━━━━━━━━━━━━\n<b>Last Trade:</b> ${lastTradeDir.includes("LONG") ? "🟢 LONG" : "🔴 SHORT"}\n<b>Now:</b> ${newDir.includes("LONG") ? "🟢 LONG" : "🔴 SHORT"} setup forming\n\n<b>Action:</b> If you are in the previous trade — CLOSE it now.\nDo NOT hold a losing trade into an opposing setup.`,
-            "shift_alert"
-          );
-        }
-      }
-    } catch (err) {
-      console.error("[Bot] Direction shift alert error:", err);
-    }
-  }
-
-  // Build result
-  if (signalsToSave.length === 0) {
+  if (qualified.length === 0) {
     let reason = "No valid setup found";
-    if (cooldownRejected > 0 && constraintRejected === 0 && candleRejected === 0 && htfRejected === 0)
-      reason = "Zone recently scanned — cooldown active";
-    else if (constraintRejected > 0 && candleRejected === 0 && htfRejected === 0)
-      reason = "Existing trade already active at this zone";
-    else if (candleRejected > 0 && htfRejected === 0)
-      reason = "Weak confirmation candle — structure not complete";
-    else if (htfRejected > 0 && candleRejected === 0)
-      reason = "HTF bias mismatch — ENTERING setups filtered";
-    else if (htfRejected > 0 || candleRejected > 0)
-      reason = "Setup rejected — HTF bias mismatch or weak candle confirmation";
+    if (cooldownRejected > 0 && constraintRejected === 0 && candleRejected === 0) reason = "Zone recently signalled — cooldown active";
+    else if (constraintRejected > 0 && candleRejected === 0) reason = "Existing trade active at zone";
+    else if (candleRejected > 0) reason = "Candle not confirmed — waiting for stronger signal";
     return { setupFound: false, count: 0, reason };
   }
 
-  return { setupFound: true, count: signalsToSave.length, reason: `${signalsToSave.length} setup(s) found` };
+  // Pick single best: SWEEP > AT_LEVEL, then by distance, then by candle strength
+  const strengthScore = (c: CandleSignal) => (c.strength === "strong" ? 3 : c.strength === "moderate" ? 2 : 1);
+  const statusScore = (s: string) => s === "SWEEP" ? 2 : 1;
+  qualified.sort((a, b) =>
+    statusScore(b.status) - statusScore(a.status) ||
+    strengthScore(b.candle) - strengthScore(a.candle) ||
+    a.dist - b.dist
+  );
+  const zone = qualified[0]!;
+
+  const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
+  const fullReason = zone.status === "SWEEP"
+    ? `Liquidity sweep at ${zone.label} — ${zone.candle.pattern} reversal (${zone.candle.strength})`
+    : `Price AT ${zone.label} — ${zone.candle.pattern} signal (${zone.candle.strength})`;
+
+  markZoneCooldown(zone.key);
+
+  // Log to signals table
+  try {
+    await db.insert(signals).values({
+      direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
+      entry, sl, slDistance, tp1, tp2, tp3,
+      currentPrice: price, session, priority,
+      reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
+    });
+  } catch (err) { console.error("[Bot] signals insert error:", err); }
+
+  // Log directly to activeTrades — no confirmation step
+  try {
+    const tradeId = `trade_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    await db.insert(activeTrades).values({
+      tradeId, direction: zone.type, zone: zone.label, zoneTier: zone.tier,
+      entry, sl, slDistance, tp1, tp2, tp3,
+    });
+  } catch (err) { console.error("[Bot] activeTrades insert error:", err); }
+
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status);
+  await sendTelegram(msg, "signal");
+
+  return { setupFound: true, count: 1, reason: fullReason };
 }
 
 // ── Track Active Trades ─────────────────────────────────────────────────────
@@ -948,24 +880,27 @@ export async function scanFVGs(
     const inGap = price >= fvg.low && price <= fvg.high;
     if (!inGap) continue;
 
+    // Minimum gap size filter — tiny gaps give no room and get spread out instantly
+    const gapSize = fvg.high - fvg.low;
+    if (gapSize < 1.5) continue;
+
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
-    // Dynamic SL/TP based on gap size
-    const gapSize = fvg.high - fvg.low;
-    const slBuffer = Math.max(spread * 2, gapSize * 0.5, 1.5);
+    // SL minimum 5 pts — same rule as zone signals
+    const slBuffer = Math.max(spread * 3, gapSize * 0.6, 5.0);
 
     let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
     if (fvg.direction === "LONG") {
-      entry = fvg.low + spread * 0.3;   // enter at lower gap edge
-      sl = fvg.low - slBuffer;           // SL just below gap
+      entry = fvg.low + spread * 0.2;
+      sl = fvg.low - slBuffer;
       const slDist = entry - sl;
       tp1 = entry + slDist * 1.5;
       tp2 = entry + slDist * 2.5;
       tp3 = entry + slDist * 4.0;
     } else {
-      entry = fvg.high - spread * 0.3;  // enter at upper gap edge
-      sl = fvg.high + slBuffer;          // SL just above gap
+      entry = fvg.high - spread * 0.2;
+      sl = fvg.high + slBuffer;
       const slDist = sl - entry;
       tp1 = entry - slDist * 1.5;
       tp2 = entry - slDist * 2.5;
@@ -976,36 +911,34 @@ export async function scanFVGs(
     count++;
 
     const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
-    const msg = `<b>🎯 ${arrow} XAU/USD — FVG RETRACE ENTRY</b>
-<b>Direction:</b> ${arrow} ${fvg.direction}
-<b>Gap:</b> $${fvg.low.toFixed(2)} – $${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+    const action = fvg.direction === "LONG" ? "BUY NOW" : "SELL NOW";
+    const msg = `<b>🚨 ${arrow} XAU/USD — ${action}</b>
+<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
 <b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
 <b>Session:</b> ${session} (${priority})`;
 
     await sendTelegram(msg, "fvg_signal");
 
+    // Log to signals table
     try {
       await db.insert(signals).values({
-        direction: fvg.direction,
-        zoneLabel: `FVG ${fvg.direction} 5m`,
-        zoneTier: "key",
-        entry,
-        sl,
-        slDistance: Math.abs(entry - sl),
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        session,
-        priority,
-        reason: `5m FVG retrace into imbalance gap $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)}`,
-        status: "AT_LEVEL",
-        zoneKey,
+        direction: fvg.direction, zoneLabel: `FVG ${fvg.direction} 5m`, zoneTier: "key",
+        entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
+        currentPrice: price, session, priority,
+        reason: `5m FVG retrace $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)}`,
+        status: "AT_LEVEL", zoneKey,
       });
-    } catch (err) {
-      console.error("[FVG] DB insert error:", err);
-    }
+    } catch (err) { console.error("[FVG] signals insert error:", err); }
+
+    // Log directly to activeTrades
+    try {
+      const tradeId = `fvg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      await db.insert(activeTrades).values({
+        tradeId, direction: fvg.direction, zone: `FVG ${fvg.direction}`, zoneTier: "key",
+        entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
+      });
+    } catch (err) { console.error("[FVG] activeTrades insert error:", err); }
   }
 
   return count > 0
@@ -1153,9 +1086,10 @@ I will alert you when TP/SL is hit.`;
   await sendTelegram(msg, "confirmed");
 }
 
-// ── Auto-Scan Loop (15-minute interval) ────────────────────────────────────
+// ── Auto-Scan Loop (3-minute interval) ─────────────────────────────────────
+// 3 min catches setups before price moves away. Cooldowns prevent duplicates.
 let autoScanInterval: ReturnType<typeof setInterval> | null = null;
-const AUTO_SCAN_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
 
 export function startAutoScan() {
   if (autoScanInterval) return;
@@ -1206,7 +1140,8 @@ export function startTradeMonitoring() {
       const priceData = await fetchGoldData();
       if (priceData) {
         await trackActiveTrades(priceData.price);
-        await expireStaleSetups(priceData.price);
+        // expireStaleSetups removed — signals now go directly to activeTrades,
+        // so there are no pending setups that can send confusing "CANCELLED" messages.
       }
     } catch (e) {
       console.log("[Bot] Trade monitor error:", e);
