@@ -61,7 +61,9 @@ function getPriceContext(): {
   return { velocity, spreadAvg, consistent, tickCount: recent.length };
 }
 
-// ── Yahoo Finance OHLC Fetching ──────────────────────────────────────────────
+// ── Twelve Data OHLC Fetching (real-time XAU/USD spot) ───────────────────────
+const TWELVE_DATA_KEY = process.env.TWELVE_DATA_API_KEY || "";
+
 interface OHLCCandle {
   time: number;
   open: number;
@@ -70,27 +72,26 @@ interface OHLCCandle {
   close: number;
 }
 
-async function fetchYahooOHLC(interval: string, range: string): Promise<OHLCCandle[]> {
-  // GC=F = Gold Futures (COMEX) — most reliable Yahoo Finance symbol for XAU/USD
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=${interval}&range=${range}`;
-  const resp = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; GoldBot/2.0)" },
-    signal: AbortSignal.timeout(6000),
-  });
-  if (resp.status !== 200) throw new Error(`Yahoo Finance HTTP ${resp.status}`);
+// interval examples: "1min", "5min", "1h", "1day"
+async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promise<OHLCCandle[]> {
+  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_KEY}`;
+  const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (resp.status !== 200) throw new Error(`Twelve Data HTTP ${resp.status}`);
   const j = await resp.json();
-  const result = j?.chart?.result?.[0];
-  if (!result) throw new Error("No chart result");
-  const timestamps: number[] = result.timestamp || [];
-  const quote = result.indicators?.quote?.[0] || {};
-  const candles: OHLCCandle[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
-    const o = quote.open?.[i], h = quote.high?.[i], l = quote.low?.[i], c = quote.close?.[i];
-    if (o != null && h != null && l != null && c != null && h > 0) {
-      candles.push({ time: timestamps[i]! * 1000, open: o, high: h, low: l, close: c });
-    }
-  }
-  return candles;
+  if (j.status === "error") throw new Error(`Twelve Data: ${j.message}`);
+  type TDRow = { datetime: string; open: string; high: string; low: string; close: string };
+  const values: TDRow[] = j.values || [];
+  // Twelve Data returns newest-first — reverse so array is oldest→newest
+  return values
+    .reverse()
+    .map(v => ({
+      time: new Date(v.datetime.replace(" ", "T") + "Z").getTime(),
+      open: parseFloat(v.open),
+      high: parseFloat(v.high),
+      low: parseFloat(v.low),
+      close: parseFloat(v.close),
+    }))
+    .filter(c => c.high > 0);
 }
 
 // ── 1-minute candle cache (for pattern detection) ─────────────────────────────
@@ -103,7 +104,7 @@ export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
     return minuteCandleCache.candles;
   }
   try {
-    const candles = await fetchYahooOHLC("1m", "1h");
+    const candles = await fetchTwelveDataOHLC("1min", 60);
     minuteCandleCache = { candles, fetchedAt: now };
     return candles;
   } catch {
@@ -131,8 +132,8 @@ const LEVELS_REFRESH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 async function refreshDynamicLevels(): Promise<void> {
   try {
     const [dailyCandles, hourlyCandles] = await Promise.allSettled([
-      fetchYahooOHLC("1d", "5d"),
-      fetchYahooOHLC("1h", "5d"),
+      fetchTwelveDataOHLC("1day", 5),
+      fetchTwelveDataOHLC("1h", 120),
     ]);
 
     const daily = dailyCandles.status === "fulfilled" ? dailyCandles.value : [];
@@ -829,6 +830,141 @@ export async function trackActiveTrades(price: number) {
   }
 }
 
+// ── FVG Detection (5-minute candles, London/NY session only) ─────────────────
+interface FVG {
+  high: number;
+  low: number;
+  direction: "LONG" | "SHORT";
+  formTime: number;
+}
+
+const fvgCache: { fvgs: FVG[]; fetchedAt: number } = { fvgs: [], fetchedAt: 0 };
+const FVG_CACHE_TTL = 2 * 60 * 1000; // refresh every 2 minutes
+
+function isLondonOrNYSession(): boolean {
+  const hour = new Date().getUTCHours();
+  // London Open 08-12, London-NY overlap 13-16, NY session 16-20
+  return (hour >= 8 && hour < 12) || (hour >= 13 && hour < 20);
+}
+
+function detectFVGs(candles: OHLCCandle[]): FVG[] {
+  const fvgs: FVG[] = [];
+  // FVG = 3-candle pattern: gap between candle[i] and candle[i+2]
+  for (let i = 0; i < candles.length - 2; i++) {
+    const c1 = candles[i]!;
+    const c3 = candles[i + 2]!;
+    // Bullish FVG: c3.low > c1.high — upward imbalance, expect bullish retrace entry
+    if (c3.low > c1.high) {
+      fvgs.push({ high: c3.low, low: c1.high, direction: "LONG", formTime: c3.time });
+    }
+    // Bearish FVG: c1.low > c3.high — downward imbalance, expect bearish retrace entry
+    if (c1.low > c3.high) {
+      fvgs.push({ high: c1.low, low: c3.high, direction: "SHORT", formTime: c3.time });
+    }
+  }
+  // Keep only gaps formed within the last 4 hours
+  const cutoff = Date.now() - 4 * 60 * 60 * 1000;
+  return fvgs.filter(f => f.formTime > cutoff);
+}
+
+export async function scanFVGs(
+  priceData: { price: number; spread: number }
+): Promise<ScanResult> {
+  if (!isLondonOrNYSession()) {
+    return { setupFound: false, count: 0, reason: "FVG: outside London/NY session" };
+  }
+
+  const { safe, message: newsMsg } = isNewsSafe();
+  if (!safe) return { setupFound: false, count: 0, reason: `FVG: news blackout — ${newsMsg}` };
+
+  // Refresh 5m candle cache
+  try {
+    const now = Date.now();
+    if (now - fvgCache.fetchedAt > FVG_CACHE_TTL) {
+      const candles5m = await fetchTwelveDataOHLC("5min", 100);
+      fvgCache.fvgs = detectFVGs(candles5m);
+      fvgCache.fetchedAt = now;
+    }
+  } catch (e) {
+    console.error("[FVG] Failed to fetch 5m candles:", e);
+    return { setupFound: false, count: 0, reason: "FVG: candle fetch failed" };
+  }
+
+  const price = priceData.price;
+  const spread = priceData.spread;
+  const { session, priority } = getSessionInfo();
+  let count = 0;
+
+  for (const fvg of fvgCache.fvgs) {
+    // Signal fires when price retraces into the gap zone
+    const inGap = price >= fvg.low && price <= fvg.high;
+    if (!inGap) continue;
+
+    const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
+    if (isZoneOnCooldown(zoneKey)) continue;
+
+    // Dynamic SL/TP based on gap size
+    const gapSize = fvg.high - fvg.low;
+    const slBuffer = Math.max(spread * 2, gapSize * 0.5, 1.5);
+
+    let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
+    if (fvg.direction === "LONG") {
+      entry = fvg.low + spread * 0.3;   // enter at lower gap edge
+      sl = fvg.low - slBuffer;           // SL just below gap
+      const slDist = entry - sl;
+      tp1 = entry + slDist * 1.5;
+      tp2 = entry + slDist * 2.5;
+      tp3 = entry + slDist * 4.0;
+    } else {
+      entry = fvg.high - spread * 0.3;  // enter at upper gap edge
+      sl = fvg.high + slBuffer;          // SL just above gap
+      const slDist = sl - entry;
+      tp1 = entry - slDist * 1.5;
+      tp2 = entry - slDist * 2.5;
+      tp3 = entry - slDist * 4.0;
+    }
+
+    markZoneCooldown(zoneKey);
+    count++;
+
+    const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
+    const msg = `<b>🎯 ${arrow} XAU/USD — FVG RETRACE ENTRY</b>
+<b>Direction:</b> ${arrow} ${fvg.direction}
+<b>Gap:</b> $${fvg.low.toFixed(2)} – $${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
+<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+<b>Session:</b> ${session} (${priority})`;
+
+    await sendTelegram(msg, "fvg_signal");
+
+    try {
+      await db.insert(signals).values({
+        direction: fvg.direction,
+        zoneLabel: `FVG ${fvg.direction} 5m`,
+        zoneTier: "key",
+        entry,
+        sl,
+        slDistance: Math.abs(entry - sl),
+        tp1,
+        tp2,
+        tp3,
+        currentPrice: price,
+        session,
+        priority,
+        reason: `5m FVG retrace into imbalance gap $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)}`,
+        status: "AT_LEVEL",
+        zoneKey,
+      });
+    } catch (err) {
+      console.error("[FVG] DB insert error:", err);
+    }
+  }
+
+  return count > 0
+    ? { setupFound: true, count, reason: `${count} FVG retrace signal(s)` }
+    : { setupFound: false, count: 0, reason: "FVG: no price retrace into active gaps" };
+}
+
 // ── Telegram Command Handler ────────────────────────────────────────────────
 let lastUpdateId = 0;
 
@@ -981,7 +1117,10 @@ export function startAutoScan() {
   (async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) await scanZones(priceData);
+      if (priceData) {
+        await scanZones(priceData);
+        await scanFVGs(priceData);
+      }
     } catch (e) {
       console.error("[Bot] Auto-scan startup error:", e);
     }
@@ -990,7 +1129,10 @@ export function startAutoScan() {
   autoScanInterval = setInterval(async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) await scanZones(priceData);
+      if (priceData) {
+        await scanZones(priceData);
+        await scanFVGs(priceData);
+      }
     } catch (e) {
       console.error("[Bot] Auto-scan error:", e);
     }
