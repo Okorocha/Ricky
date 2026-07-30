@@ -1,0 +1,2 @@
+- [tRPC + esbuild externals](trpc-esbuild-externals.md) — @trpc/* and superjson must stay in external[] in build.mjs or the api-server build fails.
+- [Ricky project setup](ricky-setup.md) — XAU/USD trading bot: ricky (React dashboard at /), api-server (Express+tRPC+Telegram bot at /api). TELEGRAM_TOKEN and TELEGRAM_CHAT_ID set as shared env vars.

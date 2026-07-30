@@ -29,6 +29,9 @@ async function buildAll() {
     // - use path traversal to read files (e.g. @google-cloud/secret-manager loads sibling .proto files)
     external: [
       "*.node",
+      // tRPC + superjson use modern ESM exports that esbuild can't bundle; keep external
+      "@trpc/*",
+      "superjson",
       "sharp",
       "better-sqlite3",
       "sqlite3",
