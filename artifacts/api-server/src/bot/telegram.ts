@@ -816,6 +816,10 @@ interface FVG {
   low: number;
   direction: "LONG" | "SHORT";
   formTime: number;
+  /** Extreme of the candle that created (anchored) the FVG — structural invalidation level.
+   *  Bullish FVG → c1.low  (below here the gap is fully invalidated)
+   *  Bearish FVG → c1.high (above here the gap is fully invalidated) */
+  invalidationExtreme: number;
 }
 
 const fvgCache: { fvgs: FVG[]; fetchedAt: number } = { fvgs: [], fetchedAt: 0 };
@@ -834,12 +838,14 @@ function detectFVGs(candles: OHLCCandle[]): FVG[] {
     const c1 = candles[i]!;
     const c3 = candles[i + 2]!;
     // Bullish FVG: c3.low > c1.high — upward imbalance, expect bullish retrace entry
+    // Invalidation extreme = c1.low (the wick that anchored the bottom of the gap)
     if (c3.low > c1.high) {
-      fvgs.push({ high: c3.low, low: c1.high, direction: "LONG", formTime: c3.time });
+      fvgs.push({ high: c3.low, low: c1.high, direction: "LONG", formTime: c3.time, invalidationExtreme: c1.low });
     }
     // Bearish FVG: c1.low > c3.high — downward imbalance, expect bearish retrace entry
+    // Invalidation extreme = c1.high (the wick that anchored the top of the gap)
     if (c1.low > c3.high) {
-      fvgs.push({ high: c1.low, low: c3.high, direction: "SHORT", formTime: c3.time });
+      fvgs.push({ high: c1.low, low: c3.high, direction: "SHORT", formTime: c3.time, invalidationExtreme: c1.high });
     }
   }
   // Keep only gaps formed within the last 4 hours
@@ -887,20 +893,23 @@ export async function scanFVGs(
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
-    // SL minimum 5 pts — same rule as zone signals
-    const slBuffer = Math.max(spread * 3, gapSize * 0.6, 5.0);
+    // SL at the structural invalidation extreme of the candle that created the FVG
+    // (c1.low for bullish, c1.high for bearish) — if that level breaks, the FVG is dead.
+    // Add a small spread buffer so we're not sitting exactly on the wick tip.
+    // Hard minimum of 5 pts still applies as a sanity check against tiny candles.
+    const spreadBuffer = spread * 1.5;
 
     let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
     if (fvg.direction === "LONG") {
       entry = fvg.low + spread * 0.2;
-      sl = fvg.low - slBuffer;
+      sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - 5.0);
       const slDist = entry - sl;
       tp1 = entry + slDist * 1.5;
       tp2 = entry + slDist * 2.5;
       tp3 = entry + slDist * 4.0;
     } else {
       entry = fvg.high - spread * 0.2;
-      sl = fvg.high + slBuffer;
+      sl = Math.max(fvg.invalidationExtreme + spreadBuffer, entry + 5.0);
       const slDist = sl - entry;
       tp1 = entry - slDist * 1.5;
       tp2 = entry - slDist * 2.5;
