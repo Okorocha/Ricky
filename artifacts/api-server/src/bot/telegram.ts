@@ -61,27 +61,179 @@ function getPriceContext(): {
   return { velocity, spreadAvg, consistent, tickCount: recent.length };
 }
 
-// ── Key Levels ──────────────────────────────────────────────────────────────
-const LEVELS: Record<string, { price: number; label: string; tier: string }> = {
-  s1: { price: 3960.00, label: "Monthly Low / Major Support", tier: "major" },
-  s2: { price: 4000.00, label: "Psychological $4000", tier: "major" },
-  s3: { price: 4017.00, label: "Previous Week Low", tier: "key" },
-  s4: { price: 4021.00, label: "Triangle Floor", tier: "major" },
-  s5: { price: 4027.00, label: "Demand Zone", tier: "key" },
-  s6: { price: 4035.00, label: "Intraday Support", tier: "minor" },
-  s7: { price: 4040.00, label: "Session Support", tier: "minor" },
-  s8: { price: 4046.00, label: "Mid-Range Support", tier: "minor" },
-  r1: { price: 4055.00, label: "VWAP / Mid-Resistance", tier: "minor" },
-  r2: { price: 4063.00, label: "50 EMA (1H)", tier: "minor" },
-  r3: { price: 4070.00, label: "50 EMA (4H)", tier: "key" },
-  r4: { price: 4077.00, label: "200 EMA (4H)", tier: "key" },
-  r5: { price: 4080.00, label: "Triangle Ceiling", tier: "major" },
-  r6: { price: 4099.00, label: "R1 Pivot", tier: "major" },
-  r7: { price: 4110.00, label: "Session High Zone", tier: "minor" },
-  r8: { price: 4120.00, label: "Intraday High", tier: "key" },
-  r9: { price: 4130.00, label: "Weekly High Resistance", tier: "major" },
-  r10: { price: 4166.00, label: "Weekly High", tier: "major" },
+// ── Yahoo Finance OHLC Fetching ──────────────────────────────────────────────
+interface OHLCCandle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
+
+async function fetchYahooOHLC(interval: string, range: string): Promise<OHLCCandle[]> {
+  // GC=F = Gold Futures (COMEX) — most reliable Yahoo Finance symbol for XAU/USD
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=${interval}&range=${range}`;
+  const resp = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; GoldBot/2.0)" },
+    signal: AbortSignal.timeout(6000),
+  });
+  if (resp.status !== 200) throw new Error(`Yahoo Finance HTTP ${resp.status}`);
+  const j = await resp.json();
+  const result = j?.chart?.result?.[0];
+  if (!result) throw new Error("No chart result");
+  const timestamps: number[] = result.timestamp || [];
+  const quote = result.indicators?.quote?.[0] || {};
+  const candles: OHLCCandle[] = [];
+  for (let i = 0; i < timestamps.length; i++) {
+    const o = quote.open?.[i], h = quote.high?.[i], l = quote.low?.[i], c = quote.close?.[i];
+    if (o != null && h != null && l != null && c != null && h > 0) {
+      candles.push({ time: timestamps[i]! * 1000, open: o, high: h, low: l, close: c });
+    }
+  }
+  return candles;
+}
+
+// ── 1-minute candle cache (for pattern detection) ─────────────────────────────
+let minuteCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const MINUTE_CACHE_TTL = 45_000; // 45 seconds
+
+export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
+  const now = Date.now();
+  if (minuteCandleCache && now - minuteCandleCache.fetchedAt < MINUTE_CACHE_TTL) {
+    return minuteCandleCache.candles;
+  }
+  try {
+    const candles = await fetchYahooOHLC("1m", "1h");
+    minuteCandleCache = { candles, fetchedAt: now };
+    return candles;
+  } catch {
+    return minuteCandleCache?.candles ?? [];
+  }
+}
+
+// ── Dynamic Level Computation ────────────────────────────────────────────────
+// Fallback static levels used until the first successful refresh
+let LEVELS: Record<string, { price: number; label: string; tier: string }> = {
+  pp:  { price: 4060.00, label: "Daily Pivot",          tier: "major" },
+  r1:  { price: 4080.00, label: "Daily R1",             tier: "key"   },
+  r2:  { price: 4110.00, label: "Daily R2",             tier: "major" },
+  r3:  { price: 4130.00, label: "Daily R3",             tier: "key"   },
+  s1:  { price: 4040.00, label: "Daily S1",             tier: "key"   },
+  s2:  { price: 4010.00, label: "Daily S2",             tier: "major" },
+  s3:  { price: 3990.00, label: "Daily S3",             tier: "key"   },
+  sh1: { price: 4120.00, label: "Swing High 1",         tier: "major" },
+  sl1: { price: 4000.00, label: "Swing Low 1",          tier: "major" },
 };
+
+let levelsRefreshedAt = 0;
+const LEVELS_REFRESH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
+
+async function refreshDynamicLevels(): Promise<void> {
+  try {
+    const [dailyCandles, hourlyCandles] = await Promise.allSettled([
+      fetchYahooOHLC("1d", "5d"),
+      fetchYahooOHLC("1h", "5d"),
+    ]);
+
+    const daily = dailyCandles.status === "fulfilled" ? dailyCandles.value : [];
+    const hourly = hourlyCandles.status === "fulfilled" ? hourlyCandles.value : [];
+
+    if (daily.length < 2) {
+      console.warn("[Bot] Not enough daily data to compute pivots — keeping current levels");
+      return;
+    }
+
+    // Use previous completed day (second-to-last; last candle may be in-progress)
+    const prev = daily[daily.length - 2]!;
+    const PP = (prev.high + prev.low + prev.close) / 3;
+    const R1 = 2 * PP - prev.low;
+    const R2 = PP + (prev.high - prev.low);
+    const R3 = prev.high + 2 * (PP - prev.low);
+    const S1 = 2 * PP - prev.high;
+    const S2 = PP - (prev.high - prev.low);
+    const S3 = prev.low - 2 * (prev.high - PP);
+
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+
+    const newLevels: Record<string, { price: number; label: string; tier: string }> = {
+      pp: { price: round2(PP), label: "Daily Pivot",  tier: "major" },
+      r1: { price: round2(R1), label: "Daily R1",     tier: "key"   },
+      r2: { price: round2(R2), label: "Daily R2",     tier: "major" },
+      r3: { price: round2(R3), label: "Daily R3",     tier: "key"   },
+      s1: { price: round2(S1), label: "Daily S1",     tier: "key"   },
+      s2: { price: round2(S2), label: "Daily S2",     tier: "major" },
+      s3: { price: round2(S3), label: "Daily S3",     tier: "key"   },
+    };
+
+    // Detect swing highs/lows from 1h data (3-bar pivot rule)
+    if (hourly.length >= 7) {
+      const lookback = 3;
+      const swingHighs: number[] = [];
+      const swingLows: number[]  = [];
+
+      for (let i = lookback; i < hourly.length - lookback; i++) {
+        const c = hourly[i]!;
+        const leftH  = hourly.slice(i - lookback, i);
+        const rightH = hourly.slice(i + 1, i + lookback + 1);
+        if (leftH.every(x => x.high <= c.high) && rightH.every(x => x.high <= c.high)) {
+          swingHighs.push(c.high);
+        }
+        if (leftH.every(x => x.low >= c.low) && rightH.every(x => x.low >= c.low)) {
+          swingLows.push(c.low);
+        }
+      }
+
+      // Most recent 3 swings, deduplicated within $2 of each other
+      const dedup = (arr: number[]): number[] =>
+        arr.filter((v, i, a) => !a.slice(0, i).some(u => Math.abs(u - v) < 2));
+
+      dedup(swingHighs).slice(-3).forEach((h, i) => {
+        newLevels[`sh${i + 1}`] = {
+          price: round2(h),
+          label: `Hourly Swing High ${i + 1}`,
+          tier: i === 0 ? "major" : "minor",
+        };
+      });
+      dedup(swingLows).slice(-3).forEach((l, i) => {
+        newLevels[`sl${i + 1}`] = {
+          price: round2(l),
+          label: `Hourly Swing Low ${i + 1}`,
+          tier: i === 0 ? "major" : "minor",
+        };
+      });
+    }
+
+    // Psychological $50 round numbers within $200 of current price
+    const currentPrice = priceHistory.length > 0
+      ? priceHistory[priceHistory.length - 1]!.price
+      : PP;
+    const roundStep = 50;
+    const base = Math.floor(currentPrice / roundStep) * roundStep;
+    for (let i = -4; i <= 4; i++) {
+      const r = base + i * roundStep;
+      // Only add if no existing level is within $5
+      if (!Object.values(newLevels).some(v => Math.abs(v.price - r) < 5)) {
+        newLevels[`rnd${r}`] = {
+          price: r,
+          label: `Psychological $${r}`,
+          tier: "minor",
+        };
+      }
+    }
+
+    LEVELS = newLevels;
+    levelsRefreshedAt = Date.now();
+    console.log(`[Bot] Dynamic levels refreshed — ${Object.keys(newLevels).length} zones | PP: $${PP.toFixed(2)} | Prev day H/L: $${prev.high.toFixed(2)}/$${prev.low.toFixed(2)}`);
+  } catch (err) {
+    console.error("[Bot] Failed to refresh dynamic levels:", err);
+  }
+}
+
+export async function ensureLevelsRefreshed(): Promise<void> {
+  if (Date.now() - levelsRefreshedAt > LEVELS_REFRESH_INTERVAL) {
+    await refreshDynamicLevels();
+  }
+}
 
 function getZoneThreshold(tier: string): { entering: number; atLevel: number; sweep: number } {
   switch (tier) {
@@ -115,67 +267,120 @@ interface CandleSignal {
   confirmed: boolean;
 }
 
+/** Detect patterns from real 1-min OHLC candles. Falls back to velocity when candles unavailable. */
 function detectCandleSignal(
   price: number,
   spread: number,
   zoneDist: number,
   zoneStatus: string,
-  direction: "LONG" | "SHORT"
+  direction: "LONG" | "SHORT",
+  candles: OHLCCandle[] = []
 ): CandleSignal {
-  const ctx = getPriceContext();
-
-  const spreadActive   = spread > 2.0;
-  const spreadModerate = spread >= 1.0 && spread <= 2.0;
-  const spreadQuiet    = spread < 1.0;
-
-  const veryClose   = zoneDist <= 1.5;
-  const closeToZone = zoneDist <= 3.5;
-
   const isLong = direction === "LONG";
-  const velocityReverts = isLong
-    ? ctx.velocity > 0.05
-    : ctx.velocity < -0.05;
-  const strongMomentum = Math.abs(ctx.velocity) > 0.15 && ctx.consistent;
 
-  if (zoneStatus === "SWEEP") {
-    if (spreadActive && veryClose && velocityReverts)
-      return { pattern: "pin_bar", strength: "strong", confirmed: true };
-    if ((spreadActive || spreadModerate) && closeToZone)
-      return { pattern: "rejection", strength: "moderate", confirmed: true };
-    return { pattern: "rejection", strength: "moderate", confirmed: true };
-  }
+  // ── Real candle analysis (requires at least 3 candles) ──────────────────
+  if (candles.length >= 3) {
+    const recent = candles.slice(-6); // last 6 one-minute candles
+    const last   = recent[recent.length - 1]!;
+    const prev   = recent[recent.length - 2]!;
 
-  if (zoneStatus === "AT_LEVEL") {
-    if (spreadActive && veryClose && velocityReverts)
-      return { pattern: "engulfing", strength: "strong", confirmed: true };
-    if (spreadActive && closeToZone && strongMomentum)
-      return { pattern: "momentum", strength: "strong", confirmed: true };
-    if (spreadActive && closeToZone)
-      return { pattern: "momentum", strength: "moderate", confirmed: true };
-    if (spreadModerate && closeToZone && velocityReverts)
-      return { pattern: "pin_bar", strength: "moderate", confirmed: true };
-    if (spreadModerate && closeToZone)
-      return { pattern: "rejection", strength: "moderate", confirmed: true };
-    if (spreadModerate)
-      return { pattern: "rejection", strength: "moderate", confirmed: true };
-    if (spreadQuiet && veryClose && velocityReverts)
-      return { pattern: "pin_bar", strength: "weak", confirmed: true };
+    const body       = Math.abs(last.close - last.open);
+    const range      = last.high - last.low;
+    const upperWick  = last.high - Math.max(last.open, last.close);
+    const lowerWick  = Math.min(last.open, last.close) - last.low;
+    const bullishBar = last.close > last.open;
+    const bearishBar = last.close < last.open;
+
+    // ── Pin Bar ─────────────────────────────────────────────────────────────
+    // Long tail into zone with small body
+    if (range > 0) {
+      const wickRatio = isLong ? lowerWick / range : upperWick / range;
+      const bodyRatio = body / range;
+      if (wickRatio >= 0.55 && bodyRatio <= 0.35) {
+        const isBullishPin = isLong && bullishBar;
+        const isBearishPin = !isLong && bearishBar;
+        if (isBullishPin || isBearishPin) {
+          return { pattern: "pin_bar", strength: "strong", confirmed: true };
+        }
+        // Opposite-colour pin still valid but moderate
+        if (wickRatio >= 0.65) {
+          return { pattern: "pin_bar", strength: "moderate", confirmed: true };
+        }
+      }
+    }
+
+    // ── Engulfing ───────────────────────────────────────────────────────────
+    const prevBody = Math.abs(prev.close - prev.open);
+    const prevBull = prev.close > prev.open;
+    const engulfsBull = isLong  && bullishBar && !prevBull && last.open <= prev.close && last.close >= prev.open;
+    const engulfsBear = !isLong && bearishBar && prevBull  && last.open >= prev.close && last.close <= prev.open;
+    if ((engulfsBull || engulfsBear) && body >= prevBody * 1.1) {
+      return { pattern: "engulfing", strength: body >= prevBody * 1.5 ? "strong" : "moderate", confirmed: true };
+    }
+
+    // ── Momentum (3-candle run) ──────────────────────────────────────────────
+    if (recent.length >= 3) {
+      const last3 = recent.slice(-3);
+      const allBull = last3.every(c => c.close > c.open);
+      const allBear = last3.every(c => c.close < c.open);
+      if ((isLong && allBull) || (!isLong && allBear)) {
+        // Confirm bodies are not shrinking (not a weakening push)
+        const bodies = last3.map(c => Math.abs(c.close - c.open));
+        const growing = bodies[2]! >= bodies[0]! * 0.7;
+        return { pattern: "momentum", strength: growing ? "strong" : "moderate", confirmed: true };
+      }
+    }
+
+    // ── Rejection wick (any candle with a wick back into zone) ──────────────
+    if (range > 0) {
+      const rejectionWick = isLong ? lowerWick / range : upperWick / range;
+      if (rejectionWick >= 0.4 && zoneDist <= 4) {
+        return { pattern: "rejection", strength: "moderate", confirmed: true };
+      }
+    }
+
+    // ── SWEEP with any reversal-direction close ──────────────────────────────
+    if (zoneStatus === "SWEEP") {
+      const reversalClose = isLong ? last.close > last.open : last.close < last.open;
+      if (reversalClose) {
+        return { pattern: "rejection", strength: body > spread * 1.5 ? "moderate" : "weak", confirmed: true };
+      }
+    }
+
+    // Candles available but no pattern confirmed
     return { pattern: "weak", strength: "weak", confirmed: false };
   }
 
-  // ENTERING zone
-  if (strongMomentum && closeToZone && velocityReverts)
-    return { pattern: "momentum", strength: "strong", confirmed: true };
-  if (spreadActive && closeToZone)
-    return { pattern: "momentum", strength: "strong", confirmed: true };
-  if (spreadModerate && closeToZone && velocityReverts)
-    return { pattern: "momentum", strength: "moderate", confirmed: true };
-  if (spreadModerate && closeToZone)
-    return { pattern: "momentum", strength: "moderate", confirmed: true };
-  // Quiet spread at close range: still a valid setup, just weak strength
-  if (spreadQuiet && closeToZone)
-    return { pattern: "momentum", strength: "weak", confirmed: true };
-  // Far from zone with quiet spread — not confirmed yet
+  // ── Velocity fallback (no candle data) ───────────────────────────────────
+  const ctx = getPriceContext();
+  const spreadActive   = spread > 2.0;
+  const spreadModerate = spread >= 1.0 && spread <= 2.0;
+  const spreadQuiet    = spread < 1.0;
+  const veryClose      = zoneDist <= 1.5;
+  const closeToZone    = zoneDist <= 3.5;
+  const velocityReverts = isLong ? ctx.velocity > 0.05 : ctx.velocity < -0.05;
+  const strongMomentum  = Math.abs(ctx.velocity) > 0.15 && ctx.consistent;
+
+  if (zoneStatus === "SWEEP") {
+    if (spreadActive && veryClose && velocityReverts) return { pattern: "pin_bar",   strength: "strong",   confirmed: true };
+    if ((spreadActive || spreadModerate) && closeToZone) return { pattern: "rejection", strength: "moderate", confirmed: true };
+    return { pattern: "rejection", strength: "moderate", confirmed: true };
+  }
+  if (zoneStatus === "AT_LEVEL") {
+    if (spreadActive && veryClose && velocityReverts)   return { pattern: "engulfing", strength: "strong",   confirmed: true };
+    if (spreadActive && closeToZone && strongMomentum)  return { pattern: "momentum",  strength: "strong",   confirmed: true };
+    if (spreadActive && closeToZone)                    return { pattern: "momentum",  strength: "moderate", confirmed: true };
+    if (spreadModerate && closeToZone && velocityReverts) return { pattern: "pin_bar", strength: "moderate", confirmed: true };
+    if (spreadModerate && closeToZone)                  return { pattern: "rejection", strength: "moderate", confirmed: true };
+    if (spreadQuiet && veryClose && velocityReverts)    return { pattern: "pin_bar",   strength: "weak",     confirmed: true };
+    return { pattern: "weak", strength: "weak", confirmed: false };
+  }
+  // ENTERING
+  if (strongMomentum && closeToZone && velocityReverts) return { pattern: "momentum", strength: "strong",   confirmed: true };
+  if (spreadActive && closeToZone)                      return { pattern: "momentum", strength: "strong",   confirmed: true };
+  if (spreadModerate && closeToZone && velocityReverts) return { pattern: "momentum", strength: "moderate", confirmed: true };
+  if (spreadModerate && closeToZone)                    return { pattern: "momentum", strength: "moderate", confirmed: true };
+  if (spreadQuiet && closeToZone)                       return { pattern: "momentum", strength: "weak",     confirmed: true };
   return { pattern: "weak", strength: "weak", confirmed: false };
 }
 
@@ -401,6 +606,12 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason: `News blackout — ${newsMsg}` };
   }
 
+  // Refresh levels if stale (non-blocking on failure — uses last known levels)
+  await ensureLevelsRefreshed();
+
+  // Fetch real 1-min candles once for the whole scan
+  const recentCandles = await getRecentMinuteCandles();
+
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
   const marketStructure = await analyzeMarketStructure(priceData);
   const { session, priority } = getSessionInfo();
@@ -470,7 +681,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     const dir = zone.type.includes("LONG") ? "LONG" : "SHORT";
     if (blockedDirections.has(dir)) { constraintRejected++; continue; }
 
-    const candle = detectCandleSignal(price, spread, zone.dist, zone.status, zone.type);
+    const candle = detectCandleSignal(price, spread, zone.dist, zone.status, zone.type, recentCandles);
     if (!candle.confirmed) { candleRejected++; continue; }
 
     const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread);
