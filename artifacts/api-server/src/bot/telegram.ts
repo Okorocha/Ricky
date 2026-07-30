@@ -545,7 +545,7 @@ export function formatSignal(
 <b>Direction:</b> ${arrow} ${direction} | ${sessionShort} (${priority})
 <b>Zone:</b> ${zoneLabel}
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : "\nReply <b>CONFIRMED</b> to track"}`;
+<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : "\nReply <b>IN</b> to confirm trade"}`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -842,6 +842,39 @@ export async function trackActiveTrades(price: number) {
     }
   } catch (err) {
     console.error("[Bot] trackActiveTrades error:", err);
+  }
+}
+
+// ── Expire Stale Setups ──────────────────────────────────────────────────────
+const SETUP_MAX_AGE_MS = 30 * 60 * 1000; // 30 minutes
+
+export async function expireStaleSetups(price: number) {
+  try {
+    const setups = await db.select().from(activeSetups);
+    for (const setup of setups) {
+      const isLong = setup.direction.includes("LONG");
+      const ageMs = Date.now() - new Date(setup.detectedAt).getTime();
+
+      // Cancel if SL level breached before the user confirmed entry
+      const slBreached = isLong ? price <= setup.sl : price >= setup.sl;
+      // Cancel if setup is older than 30 minutes
+      const tooOld = ageMs > SETUP_MAX_AGE_MS;
+
+      if (slBreached || tooOld) {
+        await db.delete(activeSetups).where(eq(activeSetups.id, setup.id));
+        const reason = slBreached
+          ? `SL level $${setup.sl.toFixed(2)} breached before entry`
+          : "Setup expired (30 min timeout)";
+        const arrow = isLong ? "🟢" : "🔴";
+        await sendTelegram(
+          `<b>⚠️ SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nZone: ${setup.zoneLabel}\nReason: ${reason}`,
+          "setup_cancelled"
+        );
+        console.log(`[Bot] Setup #${setup.id} cancelled — ${reason}`);
+      }
+    }
+  } catch (err) {
+    console.error("[Bot] expireStaleSetups error:", err);
   }
 }
 
@@ -1173,6 +1206,7 @@ export function startTradeMonitoring() {
       const priceData = await fetchGoldData();
       if (priceData) {
         await trackActiveTrades(priceData.price);
+        await expireStaleSetups(priceData.price);
       }
     } catch (e) {
       console.log("[Bot] Trade monitor error:", e);
