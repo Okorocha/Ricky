@@ -352,21 +352,22 @@ function detectSwings(candles: OHLCCandle[], lookback: number): { highs: OHLCCan
  * is making HH+HL (bullish), LH+LL (bearish), or mixed (neutral).
  */
 export function getTrendBias(
-  candles1h: OHLCCandle[],
+  candles: OHLCCandle[],
+  timeframe: string = "1h",
   maxSwings: number = 10
 ): TrendFilterResult {
-  if (candles1h.length < 10) {
+  if (candles.length < 10) {
     return {
       bias: "neutral",
       confidence: 0,
       swingCount: 0,
-      description: "Neutral — Not enough data",
+      description: `Neutral — Not enough data (${timeframe})`,
       allowLong: true,
       allowShort: true,
     };
   }
 
-  const { highs, lows } = detectSwings(candles1h, 5);
+  const { highs, lows } = detectSwings(candles, 5);
   const recentHighs = highs.slice(-maxSwings);
   const recentLows = lows.slice(-maxSwings);
 
@@ -426,9 +427,9 @@ export function getTrendBias(
   // for counter-trend trades.
 
   const descriptions: Record<TrendBias, string> = {
-    bullish: `Bullish — HH/HL structure on 1h | Confidence: ${(confidence * 100).toFixed(0)}%`,
-    bearish: `Bearish — LH/LL structure on 1h | Confidence: ${(confidence * 100).toFixed(0)}%`,
-    neutral: `Neutral — Mixed structure | All directions allowed`,
+    bullish: `Bullish — HH/HL structure on ${timeframe} | Confidence: ${(confidence * 100).toFixed(0)}%`,
+    bearish: `Bearish — LH/LL structure on ${timeframe} | Confidence: ${(confidence * 100).toFixed(0)}%`,
+    neutral: `Neutral — Mixed structure (${timeframe}) | All directions allowed`,
   };
 
   return {

@@ -223,14 +223,16 @@ const LEVELS_REFRESH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 
 async function refreshDynamicLevels(): Promise<void> {
   try {
-    const [dailyCandles, hourlyCandles, fiveMinCandles] = await Promise.allSettled([
+    const [dailyCandles, hourlyCandles, fifteenMinCandles, fiveMinCandles] = await Promise.allSettled([
       fetchTwelveDataOHLC("1day", 5),
       fetchTwelveDataOHLC("1h", 120),
+      fetchTwelveDataOHLC("15min", 150),
       fetchTwelveDataOHLC("5min", 300),
     ]);
 
     const daily = dailyCandles.status === "fulfilled" ? dailyCandles.value : [];
     const hourly = hourlyCandles.status === "fulfilled" ? hourlyCandles.value : [];
+    const fifteenMin = fifteenMinCandles.status === "fulfilled" ? fifteenMinCandles.value : [];
     const fiveMin = fiveMinCandles.status === "fulfilled" ? fiveMinCandles.value : [];
 
     // Compute Asian Session High/Low (00:00 - 07:00 UTC)
@@ -311,6 +313,50 @@ async function refreshDynamicLevels(): Promise<void> {
           tier: i === 0 ? "major" : "minor",
         };
       });
+    }
+
+    // Detect swing highs/lows from 15m data (3-bar pivot rule)
+    if (fifteenMin.length >= 7) {
+      const lookback = 3;
+      const swingHighs15m: number[] = [];
+      const swingLows15m: number[]  = [];
+
+      for (let i = lookback; i < fifteenMin.length - lookback; i++) {
+        const c = fifteenMin[i]!;
+        const leftH  = fifteenMin.slice(i - lookback, i);
+        const rightH = fifteenMin.slice(i + 1, i + lookback + 1);
+        if (leftH.every(x => x.high <= c.high) && rightH.every(x => x.high <= c.high)) {
+          swingHighs15m.push(c.high);
+        }
+        if (leftH.every(x => x.low >= c.low) && rightH.every(x => x.low >= c.low)) {
+          swingLows15m.push(c.low);
+        }
+      }
+
+      const dedup = (arr: number[]): number[] =>
+        arr.filter((v, i, a) => !a.slice(0, i).some(u => Math.abs(u - v) < 2));
+
+      dedup(swingHighs15m).slice(-3).forEach((h, i) => {
+        newLevels[`sh15m_${i + 1}`] = {
+          price: round2(h),
+          label: `15m Swing High ${i + 1}`,
+          tier: "key",
+        };
+      });
+      dedup(swingLows15m).slice(-3).forEach((l, i) => {
+        newLevels[`sl15m_${i + 1}`] = {
+          price: round2(l),
+          label: `15m Swing Low ${i + 1}`,
+          tier: "key",
+        };
+      });
+    }
+
+    // Previous Hour High/Low
+    if (hourly.length >= 2) {
+      const prevHour = hourly[hourly.length - 2]!;
+      newLevels["phh"] = { price: round2(prevHour.high), label: "Prev Hour High", tier: "key" };
+      newLevels["phl"] = { price: round2(prevHour.low),  label: "Prev Hour Low",  tier: "key" };
     }
 
     // Psychological $50 round numbers within $200 of current price
@@ -812,8 +858,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const price = priceData.price;
   const spread = priceData.spread;
 
-  // Fetch 5m candles first to compute regime
+  // Fetch candles to compute regime and trend
   const recentCandles = await getRecentFiveMinuteCandles();
+  const fifteenMinCandles = await fetchTwelveDataOHLC("15min", 100).catch(() => []);
   const hourlyCandles = await fetchTwelveDataOHLC("1h", 120).catch(() => []);
 
   // DYNAMIC: Compute regime params
@@ -864,9 +911,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     // DYNAMIC: Zone thresholds scale with regime
     const thresh = getZoneThreshold(level.tier, regime);
     let direction: "LONG" | "SHORT";
-    if (key.startsWith("sh") || key.startsWith("asian_high")) {
+    if (key.startsWith("sh") || key.startsWith("asian_high") || key.startsWith("phh")) {
       direction = "SHORT";
-    } else if (key.startsWith("sl") || key.startsWith("asian_low")) {
+    } else if (key.startsWith("sl") || key.startsWith("asian_low") || key.startsWith("phl")) {
       direction = "LONG";
     } else if (key.startsWith("s") && !key.startsWith("sh") && !key.startsWith("sl")) {
       direction = "LONG";
@@ -877,8 +924,8 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     }
 
     // Skip broken levels
-    if ((key.startsWith("sh") || key.startsWith("asian_high")) && price > level.price) continue;
-    if ((key.startsWith("sl") || key.startsWith("asian_low")) && price < level.price) continue;
+    if ((key.startsWith("sh") || key.startsWith("asian_high") || key.startsWith("phh")) && price > level.price) continue;
+    if ((key.startsWith("sl") || key.startsWith("asian_low") || key.startsWith("phl")) && price < level.price) continue;
 
     // Only fire when price is AT the level or sweeping through it
     let status: string | null = null;
@@ -922,9 +969,11 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason };
   }
 
-  // ── HTF Market Structure Trend Filter ──────────────────────────────────
-  // Pure price structure (HH/HL or LH/LL) on 1h candles — NOT an EMA.
-  const trendFilter = getTrendBias(hourlyCandles, 5);
+  // ── Multi-Timeframe Trend Filter ──────────────────────────────────
+  // Primary Filter: 15-minute trend for higher frequency
+  const trend15m = getTrendBias(fifteenMinCandles, "15m", 10);
+  // Secondary Filter: 1-hour trend for safety and priority
+  const trend1h = getTrendBias(hourlyCandles, "1h", 10);
 
   // Confluence: Check if any qualified zone aligns with an active FVG
   const confluenceZones = qualified.map(z => {
@@ -933,14 +982,17 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
       ((z.type === "LONG" && Math.abs(z.price - f.low) < scaleThreshold(3.0, regime)) ||
        (z.type === "SHORT" && Math.abs(z.price - f.high) < scaleThreshold(3.0, regime)))
     );
-    // Apply trend filter per-zone: block counter-trend in strong trends
-    const trendCheck = checkSignalTrend(z.type, trendFilter);
-    if (trendCheck === "blocked") return null; // Hard block
-    return { ...z, hasFVG, trendCheck };
+    // Apply 15m trend filter per-zone: block counter-trend in strong trends
+    const trendCheck15m = checkSignalTrend(z.type, trend15m);
+    if (trendCheck15m === "blocked") return null; // Hard block by 15m trend
+    
+    const trendCheck1h = checkSignalTrend(z.type, trend1h);
+    
+    return { ...z, hasFVG, trendCheck15m, trendCheck1h };
   }).filter((z): z is NonNullable<typeof z> => z !== null);
 
   if (confluenceZones.length === 0 && qualified.length > 0) {
-    return { setupFound: false, count: 0, reason: `All signals blocked by HTF trend filter (${trendFilter.description})` };
+    return { setupFound: false, count: 0, reason: `All signals blocked by M15 trend filter (${trend15m.description})` };
   }
 
   // Pick single best: SWEEP > AT_LEVEL, then Confluence, then Trend alignment, then distance, then candle strength
@@ -954,7 +1006,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   confluenceZones.sort((a, b) =>
     statusScore(b.status) - statusScore(a.status) ||
-    trendScore((b as any).trendCheck || "aligned") - trendScore((a as any).trendCheck || "aligned") ||
+    trendScore((b as any).trendCheck15m || "aligned") - trendScore((a as any).trendCheck15m || "aligned") ||
     (b.hasFVG ? 1 : 0) - (a.hasFVG ? 1 : 0) ||
     strengthScore(b.candle) - strengthScore(a.candle) ||
     a.dist - b.dist
@@ -971,15 +1023,14 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   }
 
   // Confluence & Trend Alignment check for A+ status
-  const h1Aligned =
-    (zone.type === "LONG" && marketStructure.h1Bias !== "bearish") ||
-    (zone.type === "SHORT" && marketStructure.h1Bias !== "bullish");
-
-  // HTF trend alignment bonus for priority scoring
-  const trendAligned = (zone as any).trendCheck === "aligned";
+  const h1Aligned = (zone as any).trendCheck1h === "aligned";
+  const m15Aligned = (zone as any).trendCheck15m === "aligned";
 
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
-  const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned && trendAligned)) ? "A+" : priority;
+  // A+ Score: M15 aligned AND (H1 aligned OR FVG confluence)
+  const isAPlus = isAsianSweep || (m15Aligned && (h1Aligned || zone.hasFVG));
+  const priorityScore = isAPlus ? "A+" : priority;
+  
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, zone.key, recentCandles, regime);
 
   // Check if SL is already breached by current price
@@ -1048,7 +1099,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   // Append win-rate to signal if available
   const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
   // DYNAMIC: Signal now includes regime info
-  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description, trendFilter) + wrAppend;
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description, trend15m) + wrAppend;
   await sendTelegram(msg, "signal");
 
   return { setupFound: true, count: 1, reason: fullReason };
@@ -1217,8 +1268,9 @@ export async function scanFVGs(
 ): Promise<ScanResult> {
   const spread = priceData.spread;
 
-  // Fetch candles for regime computation
+  // Fetch candles for regime and trend computation
   const candles5m = await getRecentFiveMinuteCandles();
+  const fifteenMinCandles = await fetchTwelveDataOHLC("15min", 100).catch(() => []);
   const hourlyCandles = await fetchTwelveDataOHLC("1h", 120).catch(() => []);
   const regime = getRegimeParams(candles5m, hourlyCandles);
 
@@ -1265,11 +1317,21 @@ export async function scanFVGs(
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
+    // Multi-Timeframe Trend Check for FVG
+    const trend15m = getTrendBias(fifteenMinCandles, "15m", 10);
+    const trend1h = getTrendBias(hourlyCandles, "1h", 10);
+    const trendCheck15m = checkSignalTrend(fvg.direction, trend15m);
+    if (trendCheck15m === "blocked") continue; // Blocked by M15 trend
+    const trendCheck1h = checkSignalTrend(fvg.direction, trend1h);
+
     // Confluence Check: Is this FVG near a Daily Level?
     const confluenceDist = scaleThreshold(3.0, regime);
     const nearDaily = Object.values(LEVELS).some(l =>
       Math.abs(l.price - (fvg.direction === "LONG" ? fvg.low : fvg.high)) < confluenceDist
     );
+
+    const m15Aligned = trendCheck15m === "aligned";
+    const h1Aligned = trendCheck1h === "aligned";
 
     // DYNAMIC: SL uses regime-aware floor instead of hardcoded 8.0
     const spreadBuffer = spread * 1.5;
@@ -1308,12 +1370,14 @@ export async function scanFVGs(
     const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
     const action = fvg.direction === "LONG" ? "BUY NOW" : "SELL NOW";
     const confluenceText = nearDaily ? " [DAILY LEVEL CONFLUENCE]" : "";
+    const priorityScore = (m15Aligned && (h1Aligned || nearDaily)) ? "A+" : priority;
+    
     const msg = `<b>🚨 ${arrow} XAU/USD — ${action}${confluenceText}</b>
-		<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
-		<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-		<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-		<b>Session:</b> ${session} (${nearDaily ? "A+" : priority})
-		<b>Regime:</b> ${regime.regime} — ${regime.description}`;
+			<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+			<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
+			<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+			<b>Session:</b> ${session} (${priorityScore})
+			<b>Regime:</b> ${regime.regime} — ${regime.description}`;
 
     await sendTelegram(msg, "fvg_signal");
 
