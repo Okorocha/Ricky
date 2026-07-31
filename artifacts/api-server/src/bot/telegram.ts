@@ -463,14 +463,20 @@ async function analyzeMarketStructure(
   priceData: { price: number; spread: number }
 ): Promise<{
   htfBias: "bullish" | "bearish" | "neutral";
+  h1Bias: "bullish" | "bearish" | "neutral";
   pullbackEnding: boolean;
   momentum: "strong" | "moderate" | "weak";
 }> {
   const price = priceData.price;
   const spread = priceData.spread;
 
-  const fiveMinCandles = await getRecentFiveMinuteCandles();
+  const [fiveMinCandles, hourlyCandles] = await Promise.all([
+    getRecentFiveMinuteCandles(),
+    fetchTwelveDataOHLC("1h", 20).catch(() => [])
+  ]);
+  
   const htfBias = get5mStructure(fiveMinCandles);
+  const h1Bias = hourlyCandles.length >= 5 ? get5mStructure(hourlyCandles) : "neutral";
   const ctx = getPriceContext();
 
   // Nearest level distance
@@ -485,7 +491,7 @@ async function analyzeMarketStructure(
   if (Math.abs(ctx.velocity) > 0.2 && ctx.consistent) momentum = "strong";
   else if (Math.abs(ctx.velocity) > 0.08 || spread > 1.5) momentum = "moderate";
 
-  return { htfBias, pullbackEnding, momentum };
+  return { htfBias, h1Bias, pullbackEnding, momentum };
 }
 
 export function getSessionInfo(): { session: string; priority: string; note: string } {
@@ -788,7 +794,17 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason };
   }
 
-  // Pick single best: SWEEP > AT_LEVEL, then by distance, then by candle strength
+  // Confluence: Check if any qualified zone aligns with an active FVG
+  const confluenceZones = qualified.map(z => {
+    const hasFVG = fvgCache.fvgs.some(f => 
+      f.direction === z.type && 
+      ((z.type === "LONG" && Math.abs(z.price - f.low) < 3) || 
+       (z.type === "SHORT" && Math.abs(z.price - f.high) < 3))
+    );
+    return { ...z, hasFVG };
+  });
+
+  // Pick single best: SWEEP > AT_LEVEL, then Confluence, then distance, then candle strength
   const strengthScore = (c: CandleSignal) => (c.strength === "strong" ? 3 : c.strength === "moderate" ? 2 : 1);
   const statusScore = (s: string) => {
     if (s === "SWEEP") return 3; // Priority 1: Liquidity Sweeps
@@ -796,35 +812,36 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return 1;
   };
   
-  qualified.sort((a, b) =>
+  confluenceZones.sort((a, b) =>
     statusScore(b.status) - statusScore(a.status) ||
+    (b.hasFVG ? 1 : 0) - (a.hasFVG ? 1 : 0) ||
     strengthScore(b.candle) - strengthScore(a.candle) ||
     a.dist - b.dist
   );
-  const zone = qualified[0]!;
+  const zone = confluenceZones[0]!;
 
-  // Pure Price Action: Filter signals that oppose the 5m market structure
+  // Pure Price Action: Filter signals that oppose the 5m OR 1h market structure
   const biasAligned =
-    (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
-    (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
+    (zone.type === "LONG" && marketStructure.htfBias !== "bearish" && marketStructure.h1Bias !== "bearish") ||
+    (zone.type === "SHORT" && marketStructure.htfBias !== "bullish" && marketStructure.h1Bias !== "bullish");
 
   if (!biasAligned && zone.status !== "SWEEP") {
-    return { setupFound: false, count: 0, reason: `Counter-trend signal — 5m Structure (${marketStructure.htfBias}) opposes direction` };
+    return { setupFound: false, count: 0, reason: `Counter-trend signal — Structure (5m:${marketStructure.htfBias} | H1:${marketStructure.h1Bias}) opposes direction` };
   }
 
-  // Special Logic: Asian High/Low Sweeps are A+ setups
+  // Special Logic: Confluence and Asian Sweeps are A+ setups
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
-  const priorityScore = isAsianSweep ? "A+" : priority;
-
+  const priorityScore = (isAsianSweep || zone.hasFVG) ? "A+" : priority;
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
   
   // Check if SL is already breached by current price
   const isLong = zone.type === "LONG";
   const slBreached = isLong ? price <= sl : price >= sl;
   
-  const fullReason = zone.status === "SWEEP"
+  const baseReason = zone.status === "SWEEP"
     ? `Liquidity sweep at ${zone.label} — ${zone.candle.pattern} reversal (${zone.candle.strength})`
     : `Price AT ${zone.label} — ${zone.candle.pattern} signal (${zone.candle.strength})`;
+  const fullReason = baseReason + (zone.hasFVG ? " [FVG CONFLUENCE]" : "");
 
   if (slBreached) {
     const warningMsg = `<b>⚠️ SETUP DETECTED BUT INVALID</b>
@@ -1067,23 +1084,24 @@ export async function scanFVGs(
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
-    // SL at the structural invalidation extreme of the candle that created the FVG
-    // (c1.low for bullish, c1.high for bearish) — if that level breaks, the FVG is dead.
-    // Add a small spread buffer so we're not sitting exactly on the wick tip.
-    // Hard minimum of 5 pts still applies as a sanity check against tiny candles.
-    const spreadBuffer = spread * 1.5;
+    // Confluence Check: Is this FVG near a Daily Level?
+    const nearDaily = Object.values(LEVELS).some(l => 
+      Math.abs(l.price - (fvg.direction === "LONG" ? fvg.low : fvg.high)) < 3
+    );
 
+    // SL at the structural invalidation extreme of the candle that created the FVG
+    const spreadBuffer = spread * 1.5;
     let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
     if (fvg.direction === "LONG") {
-      entry = fvg.low + spread * 0.2;
-      sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - 5.0);
+      entry = fvg.low + 0.5; // Use fixed offset for consistency
+      sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - 8.0);
       const slDist = entry - sl;
       tp1 = entry + slDist * 1.5;
       tp2 = entry + slDist * 2.5;
       tp3 = entry + slDist * 4.0;
     } else {
-      entry = fvg.high - spread * 0.2;
-      sl = Math.max(fvg.invalidationExtreme + spreadBuffer, entry + 5.0);
+      entry = fvg.high - 0.5;
+      sl = Math.max(fvg.invalidationExtreme + spreadBuffer, entry + 8.0);
       const slDist = sl - entry;
       tp1 = entry - slDist * 1.5;
       tp2 = entry - slDist * 2.5;
@@ -1095,11 +1113,12 @@ export async function scanFVGs(
 
     const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
     const action = fvg.direction === "LONG" ? "BUY NOW" : "SELL NOW";
-    const msg = `<b>🚨 ${arrow} XAU/USD — ${action}</b>
-	<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
-	<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-	<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-	<b>Session:</b> ${session} (${priority})`;
+    const confluenceText = nearDaily ? " [DAILY LEVEL CONFLUENCE]" : "";
+    const msg = `<b>🚨 ${arrow} XAU/USD — ${action}${confluenceText}</b>
+		<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+		<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
+		<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+		<b>Session:</b> ${session} (${nearDaily ? "A+" : priority})`;
 
     await sendTelegram(msg, "fvg_signal");
 
