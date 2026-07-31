@@ -688,12 +688,13 @@ function calculateLevels(
     const avgRange = last5.reduce((a, c) => a + (c.high - c.low), 0) / last5.length;
     atrBuffer = avgRange * 0.6; // 60% of avg candle range
   }
-  // Hard minimum: 5 pts. Covers worst-case gold spread + noise.
-  const slBuffer = Math.max(spread * 3, atrBuffer, 5.0);
+  // Hard minimum: 8.0 pts. XAU/USD needs more room during sweeps.
+  const slBuffer = Math.max(spread * 4, atrBuffer, 8.0);
   const isLong = direction === "LONG";
 
-  // Entry just inside the zone (don't chase — enter at zone edge)
-  const entry = isLong ? zonePrice + spread * 0.2 : zonePrice - spread * 0.2;
+  // Entry Offset: 0.5 pts buffer to avoid entering at the exact tip of a sweep
+  const entryOffset = 0.5;
+  const entry = isLong ? zonePrice + entryOffset : zonePrice - entryOffset;
   const sl = isLong ? zonePrice - slBuffer : zonePrice + slBuffer;
   const slDistance = Math.abs(entry - sl);
 
