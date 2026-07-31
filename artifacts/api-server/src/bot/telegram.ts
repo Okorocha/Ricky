@@ -113,6 +113,12 @@ async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promis
 let minuteCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
 const MINUTE_CACHE_TTL = 45_000; // 45 seconds
 
+let fiveMinuteCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const FIVE_MINUTE_CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+
+// ── Asian Session High/Low tracking ──────────────────────────────────────────
+let asianSessionRange: { high: number; low: number; date: string } | null = null;
+
 export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
   const now = Date.now();
   if (minuteCandleCache && now - minuteCandleCache.fetchedAt < MINUTE_CACHE_TTL) {
@@ -124,6 +130,20 @@ export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
     return candles;
   } catch {
     return minuteCandleCache?.candles ?? [];
+  }
+}
+
+export async function getRecentFiveMinuteCandles(): Promise<OHLCCandle[]> {
+  const now = Date.now();
+  if (fiveMinuteCandleCache && now - fiveMinuteCandleCache.fetchedAt < FIVE_MINUTE_CACHE_TTL) {
+    return fiveMinuteCandleCache.candles;
+  }
+  try {
+    const candles = await fetchTwelveDataOHLC("5min", 100);
+    fiveMinuteCandleCache = { candles, fetchedAt: now };
+    return candles;
+  } catch {
+    return fiveMinuteCandleCache?.candles ?? [];
   }
 }
 
@@ -146,13 +166,30 @@ const LEVELS_REFRESH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
 
 async function refreshDynamicLevels(): Promise<void> {
   try {
-    const [dailyCandles, hourlyCandles] = await Promise.allSettled([
+    const [dailyCandles, hourlyCandles, fiveMinCandles] = await Promise.allSettled([
       fetchTwelveDataOHLC("1day", 5),
       fetchTwelveDataOHLC("1h", 120),
+      fetchTwelveDataOHLC("5min", 300),
     ]);
 
     const daily = dailyCandles.status === "fulfilled" ? dailyCandles.value : [];
     const hourly = hourlyCandles.status === "fulfilled" ? hourlyCandles.value : [];
+    const fiveMin = fiveMinCandles.status === "fulfilled" ? fiveMinCandles.value : [];
+
+    // Compute Asian Session High/Low (00:00 - 07:00 UTC)
+    const todayStr = new Date().toISOString().split("T")[0]!;
+    const asianCandles = fiveMin.filter(c => {
+      const d = new Date(c.time);
+      const h = d.getUTCHours();
+      return h >= 0 && h < 7;
+    });
+    if (asianCandles.length > 0) {
+      asianSessionRange = {
+        high: Math.max(...asianCandles.map(c => c.high)),
+        low: Math.min(...asianCandles.map(c => c.low)),
+        date: todayStr
+      };
+    }
 
     if (daily.length < 2) {
       console.warn("[Bot] Not enough daily data to compute pivots — keeping current levels");
@@ -237,6 +274,12 @@ async function refreshDynamicLevels(): Promise<void> {
       }
     }
 
+    // Add Asian High/Low as key levels if available
+    if (asianSessionRange && asianSessionRange.date === todayStr) {
+      newLevels["asian_high"] = { price: asianSessionRange.high, label: "Asian Session High", tier: "major" };
+      newLevels["asian_low"]  = { price: asianSessionRange.low,  label: "Asian Session Low",  tier: "major" };
+    }
+
     LEVELS = newLevels;
     levelsRefreshedAt = Date.now();
     console.log(`[Bot] Dynamic levels refreshed — ${Object.keys(newLevels).length} zones | PP: $${PP.toFixed(2)} | Prev day H/L: $${prev.high.toFixed(2)}/$${prev.low.toFixed(2)}`);
@@ -259,18 +302,33 @@ function getZoneThreshold(tier: string): { entering: number; atLevel: number; sw
   }
 }
 
-function getHTFBias(price: number): "bullish" | "bearish" | "neutral" {
-  let above = 0, below = 0;
-  for (const [, info] of Object.entries(LEVELS)) {
-    if (info.tier === "minor") continue;
-    if (price > info.price) above++;
-    else below++;
+function get5mStructure(candles: OHLCCandle[]): "bullish" | "bearish" | "neutral" {
+  if (candles.length < 10) return "neutral";
+  
+  const recent = candles.slice(-20);
+  const highs = recent.map(c => c.high);
+  const lows = recent.map(c => c.low);
+  
+  // Simple BoS (Break of Structure) detection
+  const lastHigh = Math.max(...highs.slice(-10, -2));
+  const lastLow = Math.min(...lows.slice(-10, -2));
+  
+  const currentHigh = Math.max(...highs.slice(-2));
+  const currentLow = Math.min(...lows.slice(-2));
+  
+  if (currentHigh > lastHigh) return "bullish";
+  if (currentLow < lastLow) return "bearish";
+  
+  // Fallback to Higher Highs / Lower Lows
+  let hh = 0, ll = 0;
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i]!.high > recent[i-1]!.high) hh++;
+    if (recent[i]!.low < recent[i-1]!.low) ll++;
   }
-  const total = above + below;
-  if (total === 0) return "neutral";
-  const ratio = above / total;
-  if (ratio >= 0.65) return "bullish";
-  if (ratio <= 0.35) return "bearish";
+  
+  if (hh > ll + 3) return "bullish";
+  if (ll > hh + 3) return "bearish";
+  
   return "neutral";
 }
 
@@ -411,7 +469,8 @@ async function analyzeMarketStructure(
   const price = priceData.price;
   const spread = priceData.spread;
 
-  const htfBias = getHTFBias(price);
+  const fiveMinCandles = await getRecentFiveMinuteCandles();
+  const htfBias = get5mStructure(fiveMinCandles);
   const ctx = getPriceContext();
 
   // Nearest level distance
@@ -432,22 +491,38 @@ async function analyzeMarketStructure(
 export function getSessionInfo(): { session: string; priority: string; note: string } {
   const now = new Date();
   const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 7)   return { session: "Asian Session",       priority: "LOW",    note: "Lower liquidity, range-bound setups" };
-  if (hour >= 8 && hour < 12)  return { session: "London Open",          priority: "HIGH",   note: "Best for breakouts and trend entries" };
-  if (hour >= 13 && hour < 16) return { session: "London-NY Overlap",    priority: "BEST",   note: "Highest liquidity, strongest moves" };
-  if (hour >= 16 && hour < 20) return { session: "NY Session",           priority: "HIGH",   note: "Strong momentum, good for follow-through" };
-  return { session: "Late NY / Pre-Asian", priority: "MEDIUM", note: "Lower volume, range trades only" };
+  const min = now.getUTCMinutes();
+  
+  // More precise session mapping (UTC)
+  if (hour >= 0 && hour < 8)   return { session: "Asian Session",       priority: "LOW",    note: "Range-bound, watch Asian H/L sweeps" };
+  if (hour >= 8 && hour < 12)  return { session: "London Open",          priority: "HIGH",   note: "High volatility, trend starts" };
+  if (hour >= 12 && hour < 16) return { session: "London-NY Overlap",    priority: "BEST",   note: "Maximum liquidity, news events" };
+  if (hour >= 16 && hour < 21) return { session: "NY Session",           priority: "HIGH",   note: "Momentum continuation" };
+  return { session: "Dead Zone", priority: "LOW", note: "Low volume, avoid trading" };
 }
 
 export function isNewsSafe(): { safe: boolean; message: string } {
   const now  = new Date();
-  const day  = now.getUTCDay();
+  const day  = now.getUTCDay(); // 0=Sun, 1=Mon, ..., 5=Fri, 6=Sat
   const hour = now.getUTCHours();
   const date = now.getUTCDate();
 
-  if (day === 3 && hour >= 17 && hour <= 19) return { safe: false, message: "Fed Decision Window — NO TRADES" };
-  if (day === 5 && hour >= 13 && hour <= 15 && date <= 7) return { safe: false, message: "NFP Window — NO TRADES" };
-  if (date >= 14 && date <= 16 && hour >= 13 && hour <= 15) return { safe: false, message: "CPI Window — CAUTION" };
+  // Weekend
+  if (day === 0 || day === 6) return { safe: false, message: "Market Closed" };
+  
+  // Friday Close (Avoid holding over weekend)
+  if (day === 5 && hour >= 20) return { safe: false, message: "Friday Market Close approaching" };
+
+  // Hardcoded High-Impact Events (UTC)
+  // FOMC (Usually Wed 18:00 or 19:00 UTC)
+  if (day === 3 && hour >= 17 && hour <= 20) return { safe: false, message: "FOMC Window — Extreme Volatility" };
+  
+  // NFP (First Friday of month 12:30 or 13:30 UTC)
+  if (day === 5 && date <= 7 && hour >= 12 && hour <= 15) return { safe: false, message: "NFP Window — NO TRADES" };
+  
+  // CPI / PPI (Mid-month 12:30 UTC)
+  if (date >= 10 && date <= 16 && hour >= 12 && hour <= 14) return { safe: false, message: "Inflation Data Window — Caution" };
+  
   return { safe: true, message: "No news events — safe to trade" };
 }
 
@@ -631,6 +706,11 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const price = priceData.price;
   const spread = priceData.spread;
 
+  // Fix 4: Spread Cap (2.0 pts = 20 pips on Gold)
+  if (spread > 2.0) {
+    return { setupFound: false, count: 0, reason: `Spread too wide (${spread.toFixed(2)})` };
+  }
+
   const { safe, message: newsMsg } = isNewsSafe();
   if (!safe) {
     console.log("[Bot] News blackout — skipping scan");
@@ -694,7 +774,12 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   // Pick single best: SWEEP > AT_LEVEL, then by distance, then by candle strength
   const strengthScore = (c: CandleSignal) => (c.strength === "strong" ? 3 : c.strength === "moderate" ? 2 : 1);
-  const statusScore = (s: string) => s === "SWEEP" ? 2 : 1;
+  const statusScore = (s: string) => {
+    if (s === "SWEEP") return 3; // Priority 1: Liquidity Sweeps
+    if (s === "AT_LEVEL") return 2;
+    return 1;
+  };
+  
   qualified.sort((a, b) =>
     statusScore(b.status) - statusScore(a.status) ||
     strengthScore(b.candle) - strengthScore(a.candle) ||
@@ -702,15 +787,18 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   );
   const zone = qualified[0]!;
 
-  // Fix 3: Filter counter-trend AT_LEVEL signals when HTF bias opposes direction
-  if (zone.status === "AT_LEVEL" && zone.candle.strength !== "strong") {
-    const biasAligned =
-      (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
-      (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
-    if (!biasAligned) {
-      return { setupFound: false, count: 0, reason: `Counter-trend AT_LEVEL with ${zone.candle.strength} candle — HTF bias (${marketStructure.htfBias}) opposes direction` };
-    }
+  // Pure Price Action: Filter signals that oppose the 5m market structure
+  const biasAligned =
+    (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
+    (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
+
+  if (!biasAligned && zone.status !== "SWEEP") {
+    return { setupFound: false, count: 0, reason: `Counter-trend signal — 5m Structure (${marketStructure.htfBias}) opposes direction` };
   }
+
+  // Special Logic: Asian High/Low Sweeps are A+ setups
+  const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
+  const priorityScore = isAsianSweep ? "A+" : priority;
 
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
   const fullReason = zone.status === "SWEEP"
@@ -724,7 +812,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     await db.insert(signals).values({
       direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
       entry, sl, slDistance, tp1, tp2, tp3,
-      currentPrice: price, session, priority,
+      currentPrice: price, session, priority: priorityScore,
       reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
     });
   } catch (err) { console.error("[Bot] signals insert error:", err); }
@@ -738,7 +826,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     });
   } catch (err) { console.error("[Bot] activeTrades insert error:", err); }
 
-  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status);
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status);
   await sendTelegram(msg, "signal");
 
   return { setupFound: true, count: 1, reason: fullReason };
@@ -869,6 +957,11 @@ function detectFVGs(candles: OHLCCandle[]): FVG[] {
 export async function scanFVGs(
   priceData: { price: number; spread: number }
 ): Promise<ScanResult> {
+  const spread = priceData.spread;
+  if (spread > 2.0) {
+    return { setupFound: false, count: 0, reason: "FVG: spread too wide" };
+  }
+
   if (!isLondonOrNYSession()) {
     return { setupFound: false, count: 0, reason: "FVG: outside London/NY session" };
   }
