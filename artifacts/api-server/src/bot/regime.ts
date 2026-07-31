@@ -287,3 +287,184 @@ export function dynamicSpreadBands(regime: RegimeParams): {
     moderateMin: +(BASE_MODERATE * s).toFixed(2),
   };
 }
+// ── HTF Market Structure Trend Filter ────────────────────────────────────────
+// NOT an EMA or any lagging indicator. Uses pure price structure on 1h candles:
+// Higher Highs + Higher Lows = Bullish | Lower Highs + Lower Lows = Bearish
+// This is the same logic as swing high/low detection — real-time structural bias.
+
+export type TrendBias = "bullish" | "bearish" | "neutral";
+
+export interface TrendFilterResult {
+  /** Primary trend direction from 1h market structure. */
+  bias: TrendBias;
+  /** Confidence 0–1. High = strong structure, low = mixed/changing. */
+  confidence: number;
+  /** Number of swing points used to determine the bias. */
+  swingCount: number;
+  /** Human-readable description. */
+  description: string;
+  /** Whether a LONG signal should be allowed given the trend. */
+  allowLong: boolean;
+  /** Whether a SHORT signal should be allowed given the trend. */
+  allowShort: boolean;
+}
+
+/**
+ * Detect swing highs and swing lows from candle data.
+ * A swing high: candle[i].high > all candles within `lookback` on both sides.
+ * A swing low:  candle[i].low  < all candles within `lookback` on both sides.
+ */
+function detectSwings(candles: OHLCCandle[], lookback: number): { highs: OHLCCandle[]; lows: OHLCCandle[] } {
+  const highs: OHLCCandle[] = [];
+  const lows: OHLCCandle[] = [];
+
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const c = candles[i]!;
+    let isHigh = true, isLow = true;
+
+    for (let j = 1; j <= lookback; j++) {
+      if (candles[i - j]!.high > c.high || candles[i + j]!.high > c.high) isHigh = false;
+      if (candles[i - j]!.low  < c.low  || candles[i + j]!.low  < c.low)  isLow = false;
+      if (!isHigh && !isLow) break;
+    }
+
+    if (isHigh) highs.push(c);
+    if (isLow)  lows.push(c);
+  }
+
+  // Deduplicate: merge swings within $2 of each other
+  const dedup = (arr: OHLCCandle[]): OHLCCandle[] => {
+    const result: OHLCCandle[] = [];
+    for (const c of arr) {
+      if (!result.some(r => Math.abs(r.high - c.high) < 2 || Math.abs(r.low - c.low) < 2)) {
+        result.push(c);
+      }
+    }
+    return result;
+  };
+
+  return { highs: dedup(highs), lows: dedup(lows) };
+}
+
+/**
+ * Classify the trend from swing structure.
+ * Uses the last N swing highs and swing lows to determine if market
+ * is making HH+HL (bullish), LH+LL (bearish), or mixed (neutral).
+ */
+export function getTrendBias(
+  candles1h: OHLCCandle[],
+  maxSwings: number = 5
+): TrendFilterResult {
+  if (candles1h.length < 10) {
+    return {
+      bias: "neutral",
+      confidence: 0,
+      swingCount: 0,
+      description: "Neutral — Not enough data",
+      allowLong: true,
+      allowShort: true,
+    };
+  }
+
+  const { highs, lows } = detectSwings(candles1h, 3);
+  const recentHighs = highs.slice(-maxSwings);
+  const recentLows = lows.slice(-maxSwings);
+
+  // Count HH vs LH and HL vs LL
+  let hhCount = 0, lhCount = 0;
+  let hlCount = 0, llCount = 0;
+
+  for (let i = 1; i < recentHighs.length; i++) {
+    if (recentHighs[i]!.high > recentHighs[i - 1]!.high) hhCount++;
+    else if (recentHighs[i]!.high < recentHighs[i - 1]!.high) lhCount++;
+  }
+
+  for (let i = 1; i < recentLows.length; i++) {
+    if (recentLows[i]!.low > recentLows[i - 1]!.low) hlCount++;
+    else if (recentLows[i]!.low < recentLows[i - 1]!.low) llCount++;
+  }
+
+  const totalHighChecks = recentHighs.length - 1;
+  const totalLowChecks = recentLows.length - 1;
+
+  if (totalHighChecks === 0 || totalLowChecks === 0) {
+    return {
+      bias: "neutral",
+      confidence: 0,
+      swingCount: 0,
+      description: "Neutral — No swing structure",
+      allowLong: true,
+      allowShort: true,
+    };
+  }
+
+  const highBullishRatio = totalHighChecks > 0 ? hhCount / totalHighChecks : 0.5;
+  const lowBullishRatio = totalLowChecks > 0 ? hlCount / totalLowChecks : 0.5;
+  const bullScore = (highBullishRatio + lowBullishRatio) / 2;
+
+  // Classification
+  let bias: TrendBias;
+  let confidence: number;
+
+  if (bullScore >= 0.7) {
+    bias = "bullish";
+    confidence = Math.min(1.0, bullScore);
+  } else if (bullScore <= 0.3) {
+    bias = "bearish";
+    confidence = Math.min(1.0, 1 - bullScore);
+  } else {
+    bias = "neutral";
+    confidence = 0.3;
+  }
+
+  // Trend-aligned signals always allowed. Counter-trend only if strong candle pattern.
+  const allowLong = bias === "bullish" || bias === "neutral";
+  const allowShort = bias === "bearish" || bias === "neutral";
+
+  // If trend is strong, counter-trend signals need a higher-quality candle to be allowed.
+  // The caller (telegram.ts) can check confidence to decide if they need "strong" candles
+  // for counter-trend trades.
+
+  const descriptions: Record<TrendBias, string> = {
+    bullish: `Bullish — HH/HL structure on 1h | Confidence: ${(confidence * 100).toFixed(0)}%`,
+    bearish: `Bearish — LH/LL structure on 1h | Confidence: ${(confidence * 100).toFixed(0)}%`,
+    neutral: `Neutral — Mixed structure | All directions allowed`,
+  };
+
+  return {
+    bias,
+    confidence,
+    swingCount: Math.max(recentHighs.length, recentLows.length),
+    description: descriptions[bias],
+    allowLong,
+    allowShort,
+  };
+}
+
+/**
+ * Decide whether a signal direction is acceptable given the trend.
+ * Returns:
+ *   "aligned"    = trend agrees with signal (always allowed)
+ *   "counter"    = trend disagrees, needs strong candle to proceed
+ *   "blocked"    = neutral trend + low confidence = block
+ */
+export function checkSignalTrend(
+  signalDirection: "LONG" | "SHORT",
+  trend: TrendFilterResult
+): "aligned" | "counter" | "blocked" {
+  if (trend.bias === "neutral") {
+    // Neutral trend: allow everything but prefer aligned. We return "aligned" for all.
+    return "aligned";
+  }
+
+  const isAligned =
+    (signalDirection === "LONG"  && trend.bias === "bullish") ||
+    (signalDirection === "SHORT" && trend.bias === "bearish");
+
+  if (isAligned) return "aligned";
+
+  // Counter-trend: only block if trend is strong (confidence > 0.6)
+  if (trend.confidence > 0.6) return "blocked";
+
+  return "counter";
+}

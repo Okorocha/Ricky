@@ -11,6 +11,10 @@ import {
   dynamicRRTargets,
   dynamicVelocityThresholds,
   dynamicSpreadBands,
+  getTrendBias,
+  checkSignalTrend,
+  type TrendFilterResult,
+  type TrendBias,
 } from "./regime";
 import type { OHLCCandle } from "./regime";
 
@@ -687,19 +691,24 @@ export function formatSignal(
   entry: number, sl: number, slDist: number,
   tp1: number, tp2: number, tp3: number,
   currentPrice: number, session: string, priority: string,
-  reason: string, status: string, regime: string, regimeDesc: string
+  reason: string, status: string, regime: string, regimeDesc: string,
+  trend?: TrendFilterResult
 ): string {
   const isLong = direction.includes("LONG");
   const arrow = isLong ? "🟢" : "🔴";
   const action = isLong ? "BUY NOW" : "SELL NOW";
   const sessionShort = session.split(" ")[0];
 
+  const trendLine = trend && trend.bias !== "neutral"
+    ? `\n<b>Trend:</b> ${trend.bias.toUpperCase()} (${trend.description})`
+    : "";
+
   return `<b>🚨 ${arrow} XAU/USD — ${action}</b>
 <b>Zone:</b> ${zoneLabel} (${status === "SWEEP" ? "Liquidity Sweep" : "At Level"})
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
 <b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
 <b>Session:</b> ${sessionShort} (${priority})
-<b>Regime:</b> ${regime} — ${regimeDesc}`;
+<b>Regime:</b> ${regime} — ${regimeDesc}${trendLine}`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -912,6 +921,10 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason };
   }
 
+  // ── HTF Market Structure Trend Filter ──────────────────────────────────
+  // Pure price structure (HH/HL or LH/LL) on 1h candles — NOT an EMA.
+  const trendFilter = getTrendBias(hourlyCandles, 5);
+
   // Confluence: Check if any qualified zone aligns with an active FVG
   const confluenceZones = qualified.map(z => {
     const hasFVG = fvgCache.fvgs.some(f =>
@@ -919,19 +932,28 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
       ((z.type === "LONG" && Math.abs(z.price - f.low) < scaleThreshold(3.0, regime)) ||
        (z.type === "SHORT" && Math.abs(z.price - f.high) < scaleThreshold(3.0, regime)))
     );
-    return { ...z, hasFVG };
-  });
+    // Apply trend filter per-zone: block counter-trend in strong trends
+    const trendCheck = checkSignalTrend(z.type, trendFilter);
+    if (trendCheck === "blocked") return null; // Hard block
+    return { ...z, hasFVG, trendCheck };
+  }).filter((z): z is NonNullable<typeof z> => z !== null);
 
-  // Pick single best: SWEEP > AT_LEVEL, then Confluence, then distance, then candle strength
+  if (confluenceZones.length === 0 && qualified.length > 0) {
+    return { setupFound: false, count: 0, reason: `All signals blocked by HTF trend filter (${trendFilter.description})` };
+  }
+
+  // Pick single best: SWEEP > AT_LEVEL, then Confluence, then Trend alignment, then distance, then candle strength
   const strengthScore = (c: CandleSignal) => (c.strength === "strong" ? 3 : c.strength === "moderate" ? 2 : 1);
   const statusScore = (s: string) => {
     if (s === "SWEEP") return 3;
     if (s === "AT_LEVEL") return 2;
     return 1;
   };
+  const trendScore = (t: string) => t === "aligned" ? 2 : 1;
 
   confluenceZones.sort((a, b) =>
     statusScore(b.status) - statusScore(a.status) ||
+    trendScore((b as any).trendCheck || "aligned") - trendScore((a as any).trendCheck || "aligned") ||
     (b.hasFVG ? 1 : 0) - (a.hasFVG ? 1 : 0) ||
     strengthScore(b.candle) - strengthScore(a.candle) ||
     a.dist - b.dist
@@ -952,8 +974,11 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     (zone.type === "LONG" && marketStructure.h1Bias !== "bearish") ||
     (zone.type === "SHORT" && marketStructure.h1Bias !== "bullish");
 
+  // HTF trend alignment bonus for priority scoring
+  const trendAligned = (zone as any).trendCheck === "aligned";
+
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
-  const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned)) ? "A+" : priority;
+  const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned && trendAligned)) ? "A+" : priority;
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, zone.key, recentCandles, regime);
 
   // Check if SL is already breached by current price
@@ -1024,7 +1049,7 @@ Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
   // Append win-rate to signal if available
   const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
   // DYNAMIC: Signal now includes regime info
-  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description) + wrAppend;
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description, trendFilter) + wrAppend;
   await sendTelegram(msg, "signal");
 
   return { setupFound: true, count: 1, reason: fullReason };
