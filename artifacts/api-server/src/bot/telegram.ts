@@ -41,6 +41,8 @@ interface ZoneStats {
 }
 const zoneWinRate = new Map<string, ZoneStats>();
 const ZONE_STATS_REFRESH_INTERVAL = 15 * 60 * 1000; // refresh from DB every 15 min
+const ZONE_FILTER_MIN_TRADES = 10;
+const ZONE_FILTER_MIN_WIN_RATE = 0.35;
 let lastZoneStatsRefresh = 0;
 const breachNotifiedSetups = new Set<number>();
 
@@ -74,8 +76,12 @@ async function refreshZoneWinRate(): Promise<void> {
   }
 }
 
-function getZoneWinRate(key: string): number {
-  const stats = zoneWinRate.get(key);
+function getZoneStats(key: string, label?: string): ZoneStats | undefined {
+  return zoneWinRate.get(key) ?? (label ? zoneWinRate.get(label) : undefined);
+}
+
+function getZoneWinRate(key: string, label?: string): number {
+  const stats = getZoneStats(key, label);
   if (!stats) return 0.5; // neutral for unknown zones
   const total = stats.wins + stats.losses;
   if (total < 2) return 0.5; // not enough data
@@ -515,10 +521,11 @@ function detectCandleSignal(
     // ── Rejection wick (any candle with a wick back into zone) ──────────────
     if (range > 0) {
       const rejectionWick = isLong ? lowerWick / range : upperWick / range;
-      // Dynamic rejection distance: scales with ATR
+      // A wick alone was a poor signal in live results. Do not let a
+      // rejection-only candle open a trade.
       const dynamicRejectDist = scaleThreshold(4.0, regime);
       if (rejectionWick >= 0.4 && zoneDist <= dynamicRejectDist) {
-        return { pattern: "rejection", strength: "moderate", confirmed: true };
+        return { pattern: "rejection", strength: "weak", confirmed: false };
       }
     }
 
@@ -526,7 +533,9 @@ function detectCandleSignal(
     if (zoneStatus === "SWEEP") {
       const reversalClose = isLong ? last.close > last.open : last.close < last.open;
       if (reversalClose) {
-        return { pattern: "rejection", strength: body > spread * 1.5 ? "moderate" : "weak", confirmed: true };
+        // A single reversal close is not enough; require pin-bar, engulfing,
+        // or momentum confirmation above.
+        return { pattern: "rejection", strength: "weak", confirmed: false };
       }
     }
 
@@ -549,15 +558,15 @@ function detectCandleSignal(
 
   if (zoneStatus === "SWEEP") {
     if (spreadActive && veryClose && velocityReverts) return { pattern: "pin_bar",   strength: "strong",   confirmed: true };
-    if ((spreadActive || spreadModerate) && closeToZone) return { pattern: "rejection", strength: "moderate", confirmed: true };
-    return { pattern: "rejection", strength: "moderate", confirmed: true };
+    // Do not create a trade from an unconfirmed sweep.
+    return { pattern: "weak", strength: "weak", confirmed: false };
   }
   if (zoneStatus === "AT_LEVEL") {
     if (spreadActive && veryClose && velocityReverts)   return { pattern: "engulfing", strength: "strong",   confirmed: true };
     if (spreadActive && closeToZone && strongMomentum)  return { pattern: "momentum",  strength: "strong",   confirmed: true };
     if (spreadActive && closeToZone)                    return { pattern: "momentum",  strength: "moderate", confirmed: true };
     if (spreadModerate && closeToZone && velocityReverts) return { pattern: "pin_bar", strength: "moderate", confirmed: true };
-    if (spreadModerate && closeToZone)                  return { pattern: "rejection", strength: "moderate", confirmed: true };
+    if (spreadModerate && closeToZone)                  return { pattern: "weak", strength: "weak", confirmed: false };
     if (spreadQuiet && veryClose && velocityReverts)    return { pattern: "pin_bar",   strength: "weak",     confirmed: true };
     return { pattern: "weak", strength: "weak", confirmed: false };
   }
@@ -970,10 +979,11 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     if ((key.startsWith("sh") || key.startsWith("sl")) && status !== "SWEEP") continue;
     if ((key.startsWith("sh") || key.startsWith("sl")) && candle.strength === "weak") continue;
 
-    // Fix 5: Zone Win-Rate Filter — skip zones with < 35% win rate (need ≥3 trades)
-    const wr = getZoneWinRate(key);
-    const wrStats = zoneWinRate.get(key);
-    if (wrStats && wrStats.wins + wrStats.losses >= 3 && wr < 0.35) {
+    // Fix 5: Require a meaningful sample before disabling a zone.
+    const wrStats = getZoneStats(key, level.label);
+    const wr = getZoneWinRate(key, level.label);
+    const zoneTradeCount = wrStats ? wrStats.wins + wrStats.losses : 0;
+    if (wrStats && zoneTradeCount >= ZONE_FILTER_MIN_TRADES && wr < ZONE_FILTER_MIN_WIN_RATE) {
       console.log(`[Bot] Skipping ${key} — win rate ${wr.toFixed(2)} (${wrStats.wins}W/${wrStats.losses}L)`);
       continue;
     }
@@ -1012,6 +1022,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     // London/NY: High Frequency (Take all 15m aligned trades)
     // Asia/Dead Zone: Conservative (A+ only: 15m + 1h aligned)
     const isLondonNY = session.includes("London") || session.includes("NY");
+    if (isLondonNY && (trend15m.bias === "neutral" || trendCheck15m !== "aligned")) {
+      return null; // London/NY requires directional 15m alignment
+    }
     if (!isLondonNY && trendCheck1h !== "aligned") {
       return null; // Block non-A+ setups outside London/NY
     }
@@ -1384,6 +1397,9 @@ export async function scanFVGs(
 
     // Session-Specific Aggression for FVG
     const isLondonNY = session.includes("London") || session.includes("NY");
+    if (isLondonNY && (trend15m.bias === "neutral" || trendCheck15m !== "aligned")) {
+      continue; // London/NY requires directional 15m alignment
+    }
     if (!isLondonNY && trendCheck1h !== "aligned") {
       continue; // Block non-A+ FVG setups outside London/NY
     }

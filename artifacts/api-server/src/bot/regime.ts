@@ -202,20 +202,22 @@ export function scaleThreshold(base: number, regime: RegimeParams): number {
  * Minimum absolute floor: 4.0 pts (never go below this).
  */
 export function dynamicSLFloor(regime: RegimeParams, zoneKey: string): number {
-  const absoluteFloor = 4.0; // Never below this even in tight ranging
+  // Gold regularly sweeps 5m levels by several dollars before moving in the
+  // intended direction. Keep the stop outside normal XAU/USD noise.
+  const absoluteFloor = 10.0;
 
   // Multiplier based on regime
   let multiplier: number;
   switch (regime.regime) {
-    case "ranging":  multiplier = 1.5; break;
-    case "normal":   multiplier = 1.8; break;
-    case "trending": multiplier = 2.2; break;
-    case "choppy":   multiplier = 2.5; break;
+    case "ranging":  multiplier = 2.25; break;
+    case "normal":   multiplier = 3.0; break;
+    case "trending": multiplier = 3.5; break;
+    case "choppy":   multiplier = 3.25; break;
   }
 
   // Swing highs/lows and Asian levels are high-precision → allow tighter SL
   if (zoneKey.startsWith("sh") || zoneKey.startsWith("sl") || zoneKey.startsWith("asian")) {
-    multiplier *= 0.85; // 15% tighter for precise levels
+    multiplier *= 0.9; // only 10% tighter; gold still needs room around levels
   }
 
   const atrBased = regime.atr * multiplier;
