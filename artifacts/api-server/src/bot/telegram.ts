@@ -782,14 +782,26 @@ async function getTradeConstraints(): Promise<{
     .select()
     .from(activeTrades)
     .where(eq(activeTrades.closed, false));
+    
+  const pendingSetups = await db
+    .select()
+    .from(activeSetups);
 
   const directionCounts = new Map<string, number>();
   const blockedZoneKeys = new Set<string>();
 
+  // Block zones with active trades
   for (const trade of openTrades) {
     const dir = trade.direction.includes("LONG") ? "LONG" : "SHORT";
     directionCounts.set(dir, (directionCounts.get(dir) || 0) + 1);
     blockedZoneKeys.add(trade.zone);
+  }
+  
+  // Block zones with pending setups to prevent duplicate alerts
+  for (const setup of pendingSetups) {
+    blockedZoneKeys.add(setup.zoneKey);
+    // Also block by label just in case
+    blockedZoneKeys.add(setup.zoneLabel);
   }
 
   const blockedDirections = new Set<string>();
@@ -1065,58 +1077,63 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   markZoneCooldown(zone.key);
 
-    // Log
-    try {
-      await db.insert(signals).values({
-        direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
-        entry, sl, slDistance, tp1, tp2, tp3,
-        currentPrice: price, session, priority: priorityScore,
-        reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
-      });
-    } catch (err) { console.error("[Bot] signals insert error:", err); }
-
-    // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
-    try {
-      // FIX: Prevent duplicate pending setups for the same zone
-      const existing = await db.select().from(activeSetups).where(eq(activeSetups.zoneKey, zone.key)).limit(1);
-      if (existing.length === 0) {
-        const [newSetup] = await db.insert(activeSetups).values({
-          zoneKey: zone.key,
-          direction: zone.type,
-          zoneLabel: zone.label,
-          zoneTier: zone.tier,
-          entry,
-          sl,
-          slDistance,
-          tp1,
-          tp2,
-          tp3,
-          currentPrice: price,
-          status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-          session,
-          priority: priorityScore,
-          detectedAt: new Date(),
-        }).returning({ id: activeSetups.id });
-        
-        if (newSetup) {
-          lastSignaledSetupId = newSetup.id;
-          lastSignaledAt = Date.now();
-        }
-      } else {
-        console.log(`[Bot] Setup for ${zone.key} already pending, skipping duplicate insert.`);
-        // Update last signaled ID to the existing one so "In" still works
-        lastSignaledSetupId = existing[0].id;
-        lastSignaledAt = Date.now();
-      }
-    } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
-
   // Append win-rate to signal if available
   const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
   // DYNAMIC: Signal now includes regime info
   const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description, trend15m) + wrAppend;
-  await sendTelegram(msg, "signal");
 
-  return { setupFound: true, count: 1, reason: fullReason };
+  // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
+  try {
+    // FIX: Prevent duplicate pending setups for the same zone
+    const existing = await db.select().from(activeSetups).where(eq(activeSetups.zoneKey, zone.key)).limit(1);
+    if (existing.length === 0) {
+      // Log to signals table (only for new signals)
+      try {
+        await db.insert(signals).values({
+          direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
+          entry, sl, slDistance, tp1, tp2, tp3,
+          currentPrice: price, session, priority: priorityScore,
+          reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
+        });
+      } catch (err) { console.error("[Bot] signals insert error:", err); }
+
+      const [newSetup] = await db.insert(activeSetups).values({
+        zoneKey: zone.key,
+        direction: zone.type,
+        zoneLabel: zone.label,
+        zoneTier: zone.tier,
+        entry,
+        sl,
+        slDistance,
+        tp1,
+        tp2,
+        tp3,
+        currentPrice: price,
+        status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
+        session,
+        priority: priorityScore,
+        detectedAt: new Date(),
+      }).returning({ id: activeSetups.id });
+      
+      if (newSetup) {
+        lastSignaledSetupId = newSetup.id;
+        lastSignaledAt = Date.now();
+      }
+
+      // ONLY send Telegram alert for NEW signals
+      await sendTelegram(msg, "signal");
+      return { setupFound: true, count: 1, reason: fullReason };
+    } else {
+      console.log(`[Bot] Setup for ${zone.key} already pending, skipping duplicate alert.`);
+      // Update last signaled ID to the existing one so "In" still works
+      lastSignaledSetupId = existing[0].id;
+      lastSignaledAt = Date.now();
+      return { setupFound: false, count: 0, reason: "Setup already pending" };
+    }
+  } catch (err) { 
+    console.error("[Bot] activeSetups insert error:", err);
+    return { setupFound: false, count: 0, reason: "Error processing setup" };
+  }
 }
 
 // ── Track Active Trades ─────────────────────────────────────────────────────
@@ -1385,7 +1402,6 @@ export async function scanFVGs(
     }
 
     markZoneCooldown(zoneKey);
-    count++;
 
     const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
     const action = fvg.direction === "LONG" ? "BUY NOW" : "SELL NOW";
@@ -1393,30 +1409,29 @@ export async function scanFVGs(
     const priorityScore = (m15Aligned && (h1Aligned || nearDaily)) ? "A+" : priority;
     
     const msg = `<b>🚨 ${arrow} XAU/USD — ${action}${confluenceText}</b>
-			<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
-			<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-			<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-			<b>Session:</b> ${session} (${priorityScore})
-			<b>Regime:</b> ${regime.regime} — ${regime.description}`;
-
-    await sendTelegram(msg, "fvg_signal");
-
-    // Log to signals table
-    try {
-      await db.insert(signals).values({
-        direction: fvg.direction, zoneLabel: `FVG ${fvg.direction} 5m`, zoneTier: "key",
-        entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
-        currentPrice: price, session, priority,
-        reason: `5m FVG retrace $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)}`,
-        status: "AT_LEVEL", zoneKey,
-      });
-    } catch (err) { console.error("[FVG] signals insert error:", err); }
+				<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+				<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
+				<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+				<b>Session:</b> ${session} (${priorityScore})
+				<b>Regime:</b> ${regime.regime} — ${regime.description}`;
 
     // Restore Confirmation Flow: Log to activeSetups
     try {
       // FIX: Prevent duplicate pending setups for the same FVG
       const existing = await db.select().from(activeSetups).where(eq(activeSetups.zoneKey, zoneKey)).limit(1);
       if (existing.length === 0) {
+        count++;
+        // Log to signals table (only for new signals)
+        try {
+          await db.insert(signals).values({
+            direction: fvg.direction, zoneLabel: `FVG ${fvg.direction} 5m`, zoneTier: "key",
+            entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
+            currentPrice: price, session, priority,
+            reason: `5m FVG retrace $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)}`,
+            status: "AT_LEVEL", zoneKey,
+          });
+        } catch (err) { console.error("[FVG] signals insert error:", err); }
+
         const [newSetup] = await db.insert(activeSetups).values({
           zoneKey,
           direction: fvg.direction,
@@ -1439,8 +1454,11 @@ export async function scanFVGs(
           lastSignaledSetupId = newSetup.id;
           lastSignaledAt = Date.now();
         }
+        
+        // ONLY send Telegram alert for NEW signals
+        await sendTelegram(msg, "fvg_signal");
       } else {
-        console.log(`[Bot] FVG Setup for ${zoneKey} already pending, skipping duplicate insert.`);
+        console.log(`[Bot] FVG Setup for ${zoneKey} already pending, skipping duplicate alert.`);
         lastSignaledSetupId = existing[0].id;
         lastSignaledAt = Date.now();
       }
