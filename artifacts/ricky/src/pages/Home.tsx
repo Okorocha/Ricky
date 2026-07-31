@@ -232,13 +232,13 @@ export default function Home() {
 
   // Win rate & P&L summary
   const tradeStats = useMemo(() => {
-    if (closedTrades.length === 0) return null;
-    const wins = closedTrades.filter((t: any) => t.tp1Hit || t.tp2Hit || t.tp3Hit).length;
-    const losses = closedTrades.filter((t: any) => t.slHit && !t.tp1Hit).length;
-    const total = wins + losses;
-    const winRate = total > 0 ? Math.round((wins / total) * 100) : 0;
+    const wins = closedTrades.filter((t: any) => (t.tp1Hit || t.tp2Hit || t.tp3Hit) && !t.beHit).length;
+    const beHits = closedTrades.filter((t: any) => t.beHit).length;
+    const losses = closedTrades.filter((t: any) => t.slHit && !t.tp1Hit && !t.beHit).length;
+    const total = wins + losses + beHits;
+    const winRate = (wins + beHits) > 0 ? Math.round(((wins + beHits) / total) * 100) : 0;
     const tp3s = closedTrades.filter((t: any) => t.tp3Hit).length;
-    return { wins, losses, total, winRate, tp3s };
+    return { wins, losses, beHits, total, winRate, tp3s };
   }, [closedTrades]);
 
   return (
@@ -310,19 +310,18 @@ export default function Home() {
         </div>
 
         {/* Win Rate & P&L Summary */}
-        {tradeStats && (
-          <Card className="bg-[#0a0f1a] border-slate-800">
-            <CardHeader className="pb-1.5"><CardTitle className="text-[11px] text-slate-500 flex items-center gap-1.5"><BarChart2 className="w-3.5 h-3.5 text-amber-400" /> Performance</CardTitle></CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-4 gap-2">
-                <StatBox label="Win Rate" value={`${tradeStats.winRate}%`} className={tradeStats.winRate >= 50 ? "text-emerald-400" : "text-rose-400"} />
-                <StatBox label="Wins" value={tradeStats.wins} className="text-emerald-400" />
-                <StatBox label="Losses" value={tradeStats.losses} className="text-rose-400" />
-                <StatBox label="TP3 Hits" value={tradeStats.tp3s} className="text-amber-400" />
-              </div>
-            </CardContent>
-          </Card>
-        )}
+        <Card className="bg-[#0a0f1a] border-slate-800">
+          <CardHeader className="pb-1.5"><CardTitle className="text-[11px] text-slate-500 flex items-center gap-1.5"><BarChart2 className="w-3.5 h-3.5 text-amber-400" /> Performance</CardTitle></CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-5 gap-2">
+              <StatBox label="Win Rate" value={`${tradeStats?.winRate ?? 0}%`} className={(tradeStats?.winRate ?? 0) >= 50 ? "text-emerald-400" : "text-rose-400"} />
+              <StatBox label="Wins" value={tradeStats?.wins ?? 0} className="text-emerald-400" />
+              <StatBox label="Losses" value={tradeStats?.losses ?? 0} className="text-rose-400" />
+              <StatBox label="BE" value={tradeStats?.beHits ?? 0} className="text-amber-400" />
+              <StatBox label="TP3 Hits" value={tradeStats?.tp3s ?? 0} className="text-emerald-400" />
+            </div>
+          </CardContent>
+        </Card>
 
         {/* Active Setups */}
         {setups.length > 0 && (
