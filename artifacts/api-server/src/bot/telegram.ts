@@ -15,7 +15,55 @@ export interface ScanResult {
 
 // ── In-memory signal cooldown per zone (prevent duplicate signals) ────────────
 const zoneCooldowns = new Map<string, number>();
-const ZONE_COOLDOWN_MS = 20 * 60 * 1000; // 20 minutes
+const ZONE_COOLDOWN_MS = 35 * 60 * 1000; // 35 minutes — prevents rapid-fire re-entries after SL hit
+
+// ── Zone win-rate tracker (in-memory, survives via DB on restart) ────────────
+interface ZoneStats {
+  wins: number;
+  losses: number;
+  lastUpdated: number;
+}
+const zoneWinRate = new Map<string, ZoneStats>();
+const ZONE_STATS_REFRESH_INTERVAL = 15 * 60 * 1000; // refresh from DB every 15 min
+let lastZoneStatsRefresh = 0;
+
+async function refreshZoneWinRate(): Promise<void> {
+  try {
+    const trades = await db.select().from(activeTrades).where(eq(activeTrades.closed, true));
+    const stats = new Map<string, { wins: number; losses: number }>();
+    for (const t of trades) {
+      const key = t.zone;
+      if (!stats.has(key)) stats.set(key, { wins: 0, losses: 0 });
+      const s = stats.get(key)!;
+      // Win = TP1 hit (minimum profitable outcome)
+      if (t.tp1Hit) s.wins++;
+      if (t.slHit) s.losses++;
+    }
+    for (const [key, s] of stats) {
+      zoneWinRate.set(key, { wins: s.wins, losses: s.losses, lastUpdated: Date.now() });
+    }
+    lastZoneStatsRefresh = Date.now();
+    // Log top 5 zones by win rate
+    const sorted = Array.from(stats.entries())
+      .filter(([, s]) => s.wins + s.losses >= 2)
+      .map(([k, s]) => ({ key: k, wr: s.wins / (s.wins + s.losses), total: s.wins + s.losses }))
+      .sort((a, b) => b.wr - a.wr)
+      .slice(0, 5);
+    if (sorted.length > 0) {
+      console.log('[Bot] Zone win rates:', sorted.map(s => `${s.key}: ${s.wr.toFixed(2)} (${s.total} trades)`).join(' | '));
+    }
+  } catch (err) {
+    console.error('[Bot] Failed to refresh zone win rates:', err);
+  }
+}
+
+function getZoneWinRate(key: string): number {
+  const stats = zoneWinRate.get(key);
+  if (!stats) return 0.5; // neutral for unknown zones
+  const total = stats.wins + stats.losses;
+  if (total < 2) return 0.5; // not enough data
+  return stats.wins / total;
+}
 
 function isZoneOnCooldown(zoneKey: string): boolean {
   const last = zoneCooldowns.get(zoneKey);
@@ -694,8 +742,10 @@ function calculateLevels(
     const avgRange = last5.reduce((a, c) => a + (c.high - c.low), 0) / last5.length;
     atrBuffer = avgRange * 0.6; // 60% of avg candle range
   }
-  // Hard minimum: 8.0 pts. XAU/USD needs more room during sweeps.
-  const slBuffer = Math.max(spread * 4, atrBuffer, 8.0);
+  // Hard minimum: 12.0 pts. XAU/USD average 5m candle range is 3-6 pts,
+  // spread can be 0.5-2 pts, and liquidity sweeps often extend 8-10 pts.
+  // Anything tighter than 12 pts gets hunted before TP1 is reached.
+  const slBuffer = Math.max(spread * 4, atrBuffer, 12.0);
   const isLong = direction === "LONG";
 
   // Entry Offset: 0.5 pts buffer to avoid entering at the exact tip of a sweep
@@ -732,6 +782,10 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   }
 
   await ensureLevelsRefreshed();
+  // Refresh zone win-rate stats every 15 minutes
+  if (Date.now() - lastZoneStatsRefresh > ZONE_STATS_REFRESH_INTERVAL) {
+    await refreshZoneWinRate();
+  }
   const recentCandles = await getRecentFiveMinuteCandles(); // Use 5m for less noise
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
   const marketStructure = await analyzeMarketStructure(priceData);
@@ -800,6 +854,23 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     // Fix 2: Skip weak candles during low-priority (Asian) session
     if (priority === "LOW" && candle.strength === "weak") { candleRejected++; continue; }
 
+    // Fix 7: Swing High/Low zones require SWEEP status + strong candle
+    // AT_LEVEL on swing highs/lows has low precision — price often just passes through
+    if ((key.startsWith("sh") || key.startsWith("sl")) && status !== "SWEEP") {
+      continue;
+    }
+    if ((key.startsWith("sh") || key.startsWith("sl")) && candle.strength === "weak") {
+      continue;
+    }
+
+    // Fix 5: Zone Win-Rate Filter — skip zones with < 35% win rate (need ≥3 trades)
+    const wr = getZoneWinRate(key);
+    const wrStats = zoneWinRate.get(key);
+    if (wrStats && wrStats.wins + wrStats.losses >= 3 && wr < 0.35) {
+      console.log(`[Bot] Skipping ${key} — win rate ${wr.toFixed(2)} (${wrStats.wins}W/${wrStats.losses}L)`);
+      continue;
+    }
+
     qualified.push({ key, label: level.label, tier: level.tier, price: level.price, type: direction, dist, status, candle });
   }
 
@@ -864,7 +935,18 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const baseReason = zone.status === "SWEEP"
     ? `Liquidity sweep at ${zone.label} — ${zone.candle.pattern} reversal (${zone.candle.strength})`
     : `Price AT ${zone.label} — ${zone.candle.pattern} signal (${zone.candle.strength})`;
-  const fullReason = baseReason + (zone.hasFVG ? " [FVG CONFLUENCE]" : "");
+  // Include zone win-rate in the reason for transparency
+  const wrStats = zoneWinRate.get(zone.key);
+  const wrText = wrStats && wrStats.wins + wrStats.losses >= 2
+    ? ` [WR: ${(wrStats.wins / (wrStats.wins + wrStats.losses) * 100).toFixed(0)}% | ${wrStats.wins}W/${wrStats.losses}L]`
+    : "";
+  const fullReason = baseReason + (zone.hasFVG ? " [FVG CONFLUENCE]" : "") + wrText;
+
+  // Fix 6: Reject setups where SL distance is too tight (even after recalc)
+  if (slDistance < 12.0) {
+    console.log(`[Bot] Skipping ${zone.key} — SL distance ${slDistance.toFixed(1)} too tight`);
+    return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — needs ≥12 pts` };
+  }
 
   if (slBreached) {
     const warningMsg = `<b>⚠️ SETUP DETECTED BUT INVALID</b>
@@ -911,7 +993,9 @@ Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
     });
   } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
 
-  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status);
+  // Append win-rate to signal if available
+  const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status) + wrAppend;
   await sendTelegram(msg, "signal");
 
   return { setupFound: true, count: 1, reason: fullReason };
