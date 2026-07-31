@@ -267,15 +267,7 @@ async function refreshDynamicLevels(): Promise<void> {
 
     const round2 = (n: number) => Math.round(n * 100) / 100;
 
-    const newLevels: Record<string, { price: number; label: string; tier: string }> = {
-      pp: { price: round2(PP), label: "Daily Pivot",  tier: "major" },
-      r1: { price: round2(R1), label: "Daily R1",     tier: "key"   },
-      r2: { price: round2(R2), label: "Daily R2",     tier: "major" },
-      r3: { price: round2(R3), label: "Daily R3",     tier: "key"   },
-      s1: { price: round2(S1), label: "Daily S1",     tier: "key"   },
-      s2: { price: round2(S2), label: "Daily S2",     tier: "major" },
-      s3: { price: round2(S3), label: "Daily S3",     tier: "key"   },
-    };
+    const newLevels: Record<string, { price: number; label: string; tier: string }> = {};
 
     // Detect swing highs/lows from 1h data (3-bar pivot rule)
     if (hourly.length >= 7) {
