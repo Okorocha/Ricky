@@ -727,12 +727,15 @@ async function getTradeConstraints(): Promise<{
 }
 
 // ── Calculate TP/SL from zone level ─────────────────────────────────────────
-// SL minimum 5.0 pts — gold spread alone can be 0.5-2 pts, so anything
-// tighter than 5 pts gets taken out before price even moves.
+// SL minimum is dynamic per zone type:
+//   Swing High/Low sweeps = tight (6 pts) — high-precision entry
+//   Daily S/R levels = medium (8 pts) — standard zones
+//   Pivot/Round Numbers = wide (12 pts) — noisy zones need more room
 function calculateLevels(
   direction: "LONG" | "SHORT",
   zonePrice: number,
   spread: number,
+  zoneKey: string,
   recentCandles: OHLCCandle[] = []
 ): { entry: number; sl: number; slDistance: number; tp1: number; tp2: number; tp3: number } {
   // Dynamic ATR-based buffer from recent candle ranges
@@ -742,10 +745,18 @@ function calculateLevels(
     const avgRange = last5.reduce((a, c) => a + (c.high - c.low), 0) / last5.length;
     atrBuffer = avgRange * 0.6; // 60% of avg candle range
   }
-  // Hard minimum: 12.0 pts. XAU/USD average 5m candle range is 3-6 pts,
-  // spread can be 0.5-2 pts, and liquidity sweeps often extend 8-10 pts.
-  // Anything tighter than 12 pts gets hunted before TP1 is reached.
-  const slBuffer = Math.max(spread * 4, atrBuffer, 12.0);
+
+  // Dynamic SL floor based on zone precision
+  let slMin: number;
+  if (zoneKey.startsWith("sh") || zoneKey.startsWith("sl") || zoneKey.startsWith("asian")) {
+    slMin = 6.0; // Swing H/L sweeps are high-precision — tight SL OK
+  } else if (zoneKey.startsWith("s") || zoneKey.startsWith("r")) {
+    slMin = 8.0; // Daily support/resistance — standard
+  } else {
+    slMin = 12.0; // Pivot points & round numbers — noisy, need wide room
+  }
+
+  const slBuffer = Math.max(spread * 4, atrBuffer, slMin);
   const isLong = direction === "LONG";
 
   // Entry Offset: 0.5 pts buffer to avoid entering at the exact tip of a sweep
@@ -926,7 +937,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   // Special Logic: Confluence, Asian Sweeps, or Full Trend Alignment (5m+1h) are A+ setups
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
   const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned)) ? "A+" : priority;
-  const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
+  const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, zone.key, recentCandles);
   
   // Check if SL is already breached by current price
   const isLong = zone.type === "LONG";
@@ -942,10 +953,12 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     : "";
   const fullReason = baseReason + (zone.hasFVG ? " [FVG CONFLUENCE]" : "") + wrText;
 
-  // Fix 6: Reject setups where SL distance is too tight (even after recalc)
-  if (slDistance < 12.0) {
-    console.log(`[Bot] Skipping ${zone.key} — SL distance ${slDistance.toFixed(1)} too tight`);
-    return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — needs ≥12 pts` };
+  // Fix 6: Reject setups where SL distance is below zone-type minimum
+  const slMinForZone = zone.key.startsWith("sh") || zone.key.startsWith("sl") || zone.key.startsWith("asian")
+    ? 5.0 : zone.key.startsWith("s") || zone.key.startsWith("r") ? 7.0 : 10.0;
+  if (slDistance < slMinForZone) {
+    console.log(`[Bot] Skipping ${zone.key} — SL distance ${slDistance.toFixed(1)} below zone minimum ${slMinForZone}`);
+    return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — needs ≥${slMinForZone} pts for ${zone.key}` };
   }
 
   if (slBreached) {
