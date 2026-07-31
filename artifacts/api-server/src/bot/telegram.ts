@@ -813,7 +813,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   // Fetch 5m candles first to compute regime
   const recentCandles = await getRecentFiveMinuteCandles();
-  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 120).catch(() => []);
 
   // DYNAMIC: Compute regime params
   const regime = getRegimeParams(recentCandles, hourlyCandles);
@@ -1199,7 +1199,7 @@ export async function scanFVGs(
 
   // Fetch candles for regime computation
   const candles5m = await getRecentFiveMinuteCandles();
-  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 120).catch(() => []);
   const regime = getRegimeParams(candles5m, hourlyCandles);
 
   // DYNAMIC: Spread cap scales with regime
@@ -1491,7 +1491,7 @@ async function handleRegimeCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   const recentCandles = await getRecentFiveMinuteCandles();
-  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 120).catch(() => []);
   const regime = getRegimeParams(recentCandles, hourlyCandles);
   const rr = dynamicRRTargets(regime);
   const slFloor = dynamicSLFloor(regime, "generic");

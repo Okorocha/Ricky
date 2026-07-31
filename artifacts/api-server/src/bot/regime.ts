@@ -353,7 +353,7 @@ function detectSwings(candles: OHLCCandle[], lookback: number): { highs: OHLCCan
  */
 export function getTrendBias(
   candles1h: OHLCCandle[],
-  maxSwings: number = 5
+  maxSwings: number = 10
 ): TrendFilterResult {
   if (candles1h.length < 10) {
     return {
@@ -366,7 +366,7 @@ export function getTrendBias(
     };
   }
 
-  const { highs, lows } = detectSwings(candles1h, 3);
+  const { highs, lows } = detectSwings(candles1h, 5);
   const recentHighs = highs.slice(-maxSwings);
   const recentLows = lows.slice(-maxSwings);
 
@@ -463,8 +463,8 @@ export function checkSignalTrend(
 
   if (isAligned) return "aligned";
 
-  // Counter-trend: only block if trend is strong (confidence > 0.6)
-  if (trend.confidence > 0.6) return "blocked";
+  // Counter-trend: only block if trend is strong (confidence > 0.75)
+  if (trend.confidence > 0.75) return "blocked";
 
   return "counter";
 }
