@@ -753,14 +753,31 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     const dist = Math.abs(price - level.price);
     const thresh = getZoneThreshold(level.tier);
     let direction: "LONG" | "SHORT";
-    if (key.startsWith("s") && !key.startsWith("sh")) direction = "LONG";
-    else if (key.startsWith("r") || key.startsWith("sh")) direction = "SHORT";
-    else if (key.startsWith("asian_high")) direction = "SHORT";
-    else if (key.startsWith("asian_low")) direction = "LONG";
-    else {
+    if (key.startsWith("sh") || key.startsWith("asian_high")) {
+      // Swing Highs and Asian Highs are ALWAYS resistance → SHORT
+      direction = "SHORT";
+    } else if (key.startsWith("sl") || key.startsWith("asian_low")) {
+      // Swing Lows and Asian Lows are ALWAYS support → LONG
+      direction = "LONG";
+    } else if (key.startsWith("s") && !key.startsWith("sh") && !key.startsWith("sl")) {
+      // Daily Supports (s1, s2, s3) → support → LONG
+      direction = "LONG";
+    } else if (key.startsWith("r")) {
+      // Daily Resistances (r1, r2, r3) → resistance → SHORT
+      direction = "SHORT";
+    } else {
       // Pivot Point (pp) or Round Numbers (rnd)
       // If price is above, it acts as support (LONG). If below, resistance (SHORT).
       direction = price > level.price ? "LONG" : "SHORT";
+    }
+
+    // Skip broken levels: if price has already blown through a swing high/low,
+    // that zone is no longer valid resistance/support until price retraces.
+    if ((key.startsWith("sh") || key.startsWith("asian_high")) && price > level.price) {
+      continue; // price already above swing high — not valid resistance
+    }
+    if ((key.startsWith("sl") || key.startsWith("asian_low")) && price < level.price) {
+      continue; // price already below swing low — not valid support
     }
 
     // Only fire when price is AT the level or sweeping through it
