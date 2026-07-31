@@ -820,18 +820,24 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   );
   const zone = confluenceZones[0]!;
 
-  // Pure Price Action: Filter signals that oppose the 5m OR 1h market structure
-  const biasAligned =
-    (zone.type === "LONG" && marketStructure.htfBias !== "bearish" && marketStructure.h1Bias !== "bearish") ||
-    (zone.type === "SHORT" && marketStructure.htfBias !== "bullish" && marketStructure.h1Bias !== "bullish");
+  // Scalper-Friendly Filter: Only hard-block if it opposes the immediate 5m structure.
+  // The 1h structure is used for priority, not for blocking.
+  const biasAligned5m =
+    (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
+    (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
 
-  if (!biasAligned && zone.status !== "SWEEP") {
-    return { setupFound: false, count: 0, reason: `Counter-trend signal — Structure (5m:${marketStructure.htfBias} | H1:${marketStructure.h1Bias}) opposes direction` };
+  if (!biasAligned5m && zone.status !== "SWEEP") {
+    return { setupFound: false, count: 0, reason: `Counter-trend signal — 5m Structure (${marketStructure.htfBias}) opposes direction` };
   }
 
-  // Special Logic: Confluence and Asian Sweeps are A+ setups
+  // Confluence & Trend Alignment check for A+ status
+  const h1Aligned = 
+    (zone.type === "LONG" && marketStructure.h1Bias !== "bearish") ||
+    (zone.type === "SHORT" && marketStructure.h1Bias !== "bullish");
+
+  // Special Logic: Confluence, Asian Sweeps, or Full Trend Alignment (5m+1h) are A+ setups
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
-  const priorityScore = (isAsianSweep || zone.hasFVG) ? "A+" : priority;
+  const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned)) ? "A+" : priority;
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
   
   // Check if SL is already breached by current price
@@ -1077,9 +1083,9 @@ export async function scanFVGs(
     const inGap = price >= fvg.low && price <= fvg.high;
     if (!inGap) continue;
 
-    // Minimum gap size filter — increased to 2.5 for less noise (higher quality gaps)
+    // Minimum gap size filter — 2.0 is a good balance for Gold scalping (20 pips)
     const gapSize = fvg.high - fvg.low;
-    if (gapSize < 2.5) continue;
+    if (gapSize < 2.0) continue;
 
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
