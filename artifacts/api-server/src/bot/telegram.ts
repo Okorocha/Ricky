@@ -42,6 +42,7 @@ interface ZoneStats {
 const zoneWinRate = new Map<string, ZoneStats>();
 const ZONE_STATS_REFRESH_INTERVAL = 15 * 60 * 1000; // refresh from DB every 15 min
 let lastZoneStatsRefresh = 0;
+const breachNotifiedSetups = new Set<number>();
 
 async function refreshZoneWinRate(): Promise<void> {
   try {
@@ -1001,16 +1002,14 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — regime ${regime.regime} requires ≥${slMinForZone.toFixed(1)} pts` };
   }
 
-  if (slBreached) {
-    const warningMsg = `<b>⚠️ SETUP DETECTED BUT INVALID</b>
-Entry: $${entry.toFixed(2)}
-SL: $${sl.toFixed(2)}
-Current Price: $${price.toFixed(2)}
+  // Safety Buffer: Don't signal if price is already too close to SL (within 25% of SL distance)
+  const proximityToSL = isLong ? (price - sl) : (sl - price);
+  const tooCloseToSL = proximityToSL < (slDistance * 0.25);
 
-Reason: Price broke through the stop loss level.
-Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
-    await sendTelegram(warningMsg, "signal_warning");
-    return { setupFound: false, count: 0, reason: "SL breached at detection" };
+  if (slBreached || tooCloseToSL) {
+    const reason = slBreached ? "Price broke through the stop loss level." : "Price is too close to SL for a safe entry.";
+    console.log(`[Bot] Skipping ${zone.key} — ${reason} (Price: ${price.toFixed(2)}, SL: ${sl.toFixed(2)})`);
+    return { setupFound: false, count: 0, reason: "SL breached or too close at detection" };
   }
 
   markZoneCooldown(zone.key);
@@ -1133,24 +1132,45 @@ export async function expireStaleSetups(price: number) {
       const tooOld = ageMs > SETUP_MAX_AGE_MS;
 
       if (slBreached || tooOld) {
-        await db.delete(activeSetups).where(eq(activeSetups.id, setup.id));
         const reason = slBreached
-          ? "Price broke through the stop loss level."
+          ? "Price hit the Stop Loss level."
           : "Setup expired (30 min timeout)";
         const arrow = isLong ? "🟢" : "🔴";
 
-        const cancelMsg = slBreached
-          ? `<b>⚠️ SETUP CANCELLED</b>
+        // If SL breached, give a 5-minute grace period for confirmation before deleting
+        const gracePeriod = 5 * 60 * 1000;
+        const isWithinGrace = slBreached && ageMs < gracePeriod;
+
+        if (tooOld || (slBreached && !isWithinGrace)) {
+          await db.delete(activeSetups).where(eq(activeSetups.id, setup.id));
+          breachNotifiedSetups.delete(setup.id);
+          
+          const cancelMsg = slBreached
+            ? `<b>⚠️ SETUP EXPIRED (STOPPED OUT)</b>
 Entry: $${setup.entry.toFixed(2)}
 SL: $${setup.sl.toFixed(2)}
 Current Price: $${price.toFixed(2)}
 
 Reason: ${reason}
-Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`
-          : `<b>⚠️ SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nZone: ${setup.zoneLabel}\nReason: ${reason}`;
+Action: Setup is no longer valid.`
+            : `<b>⚠️ SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nZone: ${setup.zoneLabel}\nReason: ${reason}`;
 
-        await sendTelegram(cancelMsg, "setup_cancelled");
-        console.log(`[Bot] Setup #${setup.id} cancelled — ${reason}`);
+          await sendTelegram(cancelMsg, "setup_cancelled");
+          console.log(`[Bot] Setup #${setup.id} ${slBreached ? 'expired' : 'cancelled'} — ${reason}`);
+        } else if (slBreached && isWithinGrace && !breachNotifiedSetups.has(setup.id)) {
+          // Send a warning instead of a cancellation, so user can still confirm "IN"
+          const warningMsg = `<b>⚠️ PENDING SETUP STOPPED OUT</b>
+${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}
+SL: $${setup.sl.toFixed(2)} | Current: $${price.toFixed(2)}
+
+Reason: Price hit SL immediately. 
+<b>If you already entered, reply "IN" to track this loss.</b> Otherwise, do NOT enter.`;
+          
+          await sendTelegram(warningMsg, "setup_warning");
+          breachNotifiedSetups.add(setup.id);
+          console.log(`[Bot] Setup #${setup.id} breached but keeping for grace period.`);
+          // Do NOT delete yet, allow user to confirm "IN" for 5 minutes
+        }
       }
     }
   } catch (err) {
@@ -1255,7 +1275,8 @@ export async function scanFVGs(
     const spreadBuffer = spread * 1.5;
     const slFloor = dynamicSLFloor(regime, zoneKey);
     let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
-    if (fvg.direction === "LONG") {
+    const isLong = fvg.direction === "LONG";
+    if (isLong) {
       entry = fvg.low + 0.5;
       sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - slFloor);
       const slDist = entry - sl;
@@ -1271,6 +1292,14 @@ export async function scanFVGs(
       tp1 = entry - slDist * rr.tp1;
       tp2 = entry - slDist * rr.tp2;
       tp3 = entry - slDist * rr.tp3;
+    }
+
+    // FVG Safety Buffer
+    const slDistance = Math.abs(entry - sl);
+    const proximityToSL = isLong ? (price - sl) : (sl - price);
+    const slBreached = isLong ? price <= sl : price >= sl;
+    if (slBreached || proximityToSL < (slDistance * 0.25)) {
+      continue; // Skip dying FVG setups
     }
 
     markZoneCooldown(zoneKey);
