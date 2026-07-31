@@ -816,9 +816,26 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const priorityScore = isAsianSweep ? "A+" : priority;
 
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
+  
+  // Check if SL is already breached by current price
+  const isLong = zone.type === "LONG";
+  const slBreached = isLong ? price <= sl : price >= sl;
+  
   const fullReason = zone.status === "SWEEP"
     ? `Liquidity sweep at ${zone.label} — ${zone.candle.pattern} reversal (${zone.candle.strength})`
     : `Price AT ${zone.label} — ${zone.candle.pattern} signal (${zone.candle.strength})`;
+
+  if (slBreached) {
+    const warningMsg = `<b>⚠️ SETUP DETECTED BUT INVALID</b>
+Entry: $${entry.toFixed(2)}
+SL: $${sl.toFixed(2)}
+Current Price: $${price.toFixed(2)}
+
+Reason: Price broke through the stop loss level.
+Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
+    await sendTelegram(warningMsg, "signal_warning");
+    return { setupFound: false, count: 0, reason: "SL breached at detection" };
+  }
 
   markZoneCooldown(zone.key);
 
@@ -835,8 +852,20 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
   try {
     await db.insert(activeSetups).values({
-      direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
-      entry, sl, slDistance, tp1, tp2, tp3,
+      zoneKey: zone.key,
+      direction: zone.type,
+      zoneLabel: zone.label,
+      zoneTier: zone.tier,
+      entry,
+      sl,
+      slDistance,
+      tp1,
+      tp2,
+      tp3,
+      currentPrice: price,
+      status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
+      session,
+      priority: priorityScore,
       detectedAt: new Date(),
     });
   } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
@@ -927,13 +956,21 @@ export async function expireStaleSetups(price: number) {
       if (slBreached || tooOld) {
         await db.delete(activeSetups).where(eq(activeSetups.id, setup.id));
         const reason = slBreached
-          ? `SL level $${setup.sl.toFixed(2)} breached before entry`
+          ? "Price broke through the stop loss level."
           : "Setup expired (30 min timeout)";
         const arrow = isLong ? "🟢" : "🔴";
-        await sendTelegram(
-          `<b>⚠️ SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nZone: ${setup.zoneLabel}\nReason: ${reason}`,
-          "setup_cancelled"
-        );
+        
+        const cancelMsg = slBreached 
+          ? `<b>⚠️ SETUP CANCELLED</b>
+Entry: $${setup.entry.toFixed(2)}
+SL: $${setup.sl.toFixed(2)}
+Current Price: $${price.toFixed(2)}
+
+Reason: ${reason}
+Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`
+          : `<b>⚠️ SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nZone: ${setup.zoneLabel}\nReason: ${reason}`;
+
+        await sendTelegram(cancelMsg, "setup_cancelled");
         console.log(`[Bot] Setup #${setup.id} cancelled — ${reason}`);
       }
     }
@@ -1079,8 +1116,20 @@ export async function scanFVGs(
     // Restore Confirmation Flow: Log to activeSetups
     try {
       await db.insert(activeSetups).values({
-        direction: fvg.direction, zoneLabel: `FVG ${fvg.direction} 5m`, zoneTier: "key",
-        entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
+        zoneKey,
+        direction: fvg.direction,
+        zoneLabel: `FVG ${fvg.direction} 5m`,
+        zoneTier: "key",
+        entry,
+        sl,
+        slDistance: Math.abs(entry - sl),
+        tp1,
+        tp2,
+        tp3,
+        currentPrice: price,
+        status: "AT_LEVEL",
+        session,
+        priority,
         detectedAt: new Date(),
       });
     } catch (err) { console.error("[FVG] activeSetups insert error:", err); }
@@ -1112,9 +1161,11 @@ export async function handleTelegramUpdates() {
 
       if (String(chatId) !== String(CHAT_ID)) continue;
 
-      const cmdMatch = text.match(/^IN(\s+(\d+))?$/);
-      if (cmdMatch) {
-        const index = cmdMatch[2] ? parseInt(cmdMatch[2]) - 1 : null;
+      // More robust command matching (handles "IN", "I'M IN", "IN 1", etc.)
+      const isConfirm = text.includes("IN") && (text.startsWith("IN") || text.includes("I'M IN") || text.includes("IM IN"));
+      if (isConfirm) {
+        const numMatch = text.match(/\d+/);
+        const index = numMatch ? parseInt(numMatch[0]) - 1 : null;
         await handleConfirmedCommand(index);
         continue;
       }
