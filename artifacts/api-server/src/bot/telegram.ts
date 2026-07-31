@@ -745,8 +745,16 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   for (const [key, level] of Object.entries(LEVELS)) {
     const dist = Math.abs(price - level.price);
     const thresh = getZoneThreshold(level.tier);
-    const isSupport = key.startsWith("s") && !key.startsWith("sh");
-    const direction: "LONG" | "SHORT" = isSupport ? "LONG" : "SHORT";
+    let direction: "LONG" | "SHORT";
+    if (key.startsWith("s") && !key.startsWith("sh")) direction = "LONG";
+    else if (key.startsWith("r") || key.startsWith("sh")) direction = "SHORT";
+    else if (key.startsWith("asian_high")) direction = "SHORT";
+    else if (key.startsWith("asian_low")) direction = "LONG";
+    else {
+      // Pivot Point (pp) or Round Numbers (rnd)
+      // If price is above, it acts as support (LONG). If below, resistance (SHORT).
+      direction = price > level.price ? "LONG" : "SHORT";
+    }
 
     // Only fire when price is AT the level or sweeping through it
     let status: string | null = null;
@@ -824,14 +832,14 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     });
   } catch (err) { console.error("[Bot] signals insert error:", err); }
 
-  // Log directly to activeTrades — no confirmation step
+  // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
   try {
-    const tradeId = `trade_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    await db.insert(activeTrades).values({
-      tradeId, direction: zone.type, zone: zone.label, zoneTier: zone.tier,
+    await db.insert(activeSetups).values({
+      direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
       entry, sl, slDistance, tp1, tp2, tp3,
+      detectedAt: new Date(),
     });
-  } catch (err) { console.error("[Bot] activeTrades insert error:", err); }
+  } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
 
   const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status);
   await sendTelegram(msg, "signal");
@@ -1050,10 +1058,10 @@ export async function scanFVGs(
     const arrow = fvg.direction === "LONG" ? "🟢" : "🔴";
     const action = fvg.direction === "LONG" ? "BUY NOW" : "SELL NOW";
     const msg = `<b>🚨 ${arrow} XAU/USD — ${action}</b>
-<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
-<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-<b>Session:</b> ${session} (${priority})`;
+	<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
+	<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
+	<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
+	<b>Session:</b> ${session} (${priority})`;
 
     await sendTelegram(msg, "fvg_signal");
 
@@ -1068,14 +1076,14 @@ export async function scanFVGs(
       });
     } catch (err) { console.error("[FVG] signals insert error:", err); }
 
-    // Log directly to activeTrades
+    // Restore Confirmation Flow: Log to activeSetups
     try {
-      const tradeId = `fvg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      await db.insert(activeTrades).values({
-        tradeId, direction: fvg.direction, zone: `FVG ${fvg.direction}`, zoneTier: "key",
+      await db.insert(activeSetups).values({
+        direction: fvg.direction, zoneLabel: `FVG ${fvg.direction} 5m`, zoneTier: "key",
         entry, sl, slDistance: Math.abs(entry - sl), tp1, tp2, tp3,
+        detectedAt: new Date(),
       });
-    } catch (err) { console.error("[FVG] activeTrades insert error:", err); }
+    } catch (err) { console.error("[FVG] activeSetups insert error:", err); }
   }
 
   return count > 0
