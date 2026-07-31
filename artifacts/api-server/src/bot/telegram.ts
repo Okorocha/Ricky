@@ -1163,7 +1163,14 @@ export async function trackActiveTrades(price: number) {
       if (trade.tp1Hit && !trade.tp2Hit) {
         const tp2Reached = isLong ? price >= trade.tp2 : price <= trade.tp2;
         if (tp2Reached) {
-          await db.update(activeTrades).set({ tp2Hit: true, tp2HitAt: new Date() }).where(eq(activeTrades.id, trade.id));
+          // Update TP2 hit and move SL to TP1 (Locking in profit)
+          await db.update(activeTrades)
+            .set({ 
+              tp2Hit: true, 
+              tp2HitAt: new Date(),
+              sl: trade.tp1 // MOVE SL TO TP1
+            })
+            .where(eq(activeTrades.id, trade.id));
           await sendTelegram(formatTPHit(trade, "TP2", price), "tp_hit");
         }
       }
@@ -1177,17 +1184,20 @@ export async function trackActiveTrades(price: number) {
         }
       }
 
-      if (!trade.slHit) {
+      if (!trade.slHit && !trade.beHit) {
         const slReached = isLong ? price <= trade.sl : price >= trade.sl;
         if (slReached) {
-          const isBE = trade.tp1Hit; // If TP1 was hit, this is a BE hit, not a full SL loss
-          await db.update(activeTrades)
-            .set({ slHit: true, slHitAt: new Date(), closed: true })
-            .where(eq(activeTrades.id, trade.id));
-
+          const isBE = trade.tp1Hit; // If TP1 was hit, this is a BE or Trailing Stop hit
+          
           if (isBE) {
+            await db.update(activeTrades)
+              .set({ beHit: true, beHitAt: new Date(), closed: true })
+              .where(eq(activeTrades.id, trade.id));
             await sendTelegram(formatBEHit(trade, price), "be_hit");
           } else {
+            await db.update(activeTrades)
+              .set({ slHit: true, slHitAt: new Date(), closed: true })
+              .where(eq(activeTrades.id, trade.id));
             await sendTelegram(formatSLHit(trade, price), "sl_hit");
           }
         }

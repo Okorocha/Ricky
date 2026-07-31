@@ -75,12 +75,14 @@ export const activeTrades = pgTable("activeTrades", {
   tp2Hit: boolean("tp2Hit").default(false).notNull(),
   tp3Hit: boolean("tp3Hit").default(false).notNull(),
   slHit: boolean("slHit").default(false).notNull(),
+  beHit: boolean("beHit").default(false).notNull(),
   closed: boolean("closed").default(false).notNull(),
   confirmedAt: timestamp("confirmedAt").defaultNow().notNull(),
   tp1HitAt: timestamp("tp1HitAt"),
   tp2HitAt: timestamp("tp2HitAt"),
   tp3HitAt: timestamp("tp3HitAt"),
   slHitAt: timestamp("slHitAt"),
+  beHitAt: timestamp("beHitAt"),
 });
 
 export const telegramLog = pgTable("telegramLog", {

@@ -121,7 +121,7 @@ function SetupCard({ setup }: { setup: any }) {
 function TradeCard({ trade }: { trade: any }) {
   const isLong = trade.direction.includes("LONG");
   const isOpen = !trade.closed;
-  const result = trade.slHit ? "SL" : trade.tp3Hit ? "TP3" : trade.tp2Hit ? "TP2" : trade.tp1Hit ? "TP1+" : null;
+  const result = trade.beHit ? "BE" : trade.slHit ? "SL" : trade.tp3Hit ? "TP3" : trade.tp2Hit ? "TP2" : trade.tp1Hit ? "TP1+" : null;
 
   return (
     <div className={`p-3 rounded-lg border bg-slate-900/60 ${isOpen ? "border-emerald-500/30" : "border-slate-700/40"}`}>
@@ -140,6 +140,7 @@ function TradeCard({ trade }: { trade: any }) {
           {trade.tp1Hit && <Badge className="text-[9px] h-3.5 px-1 bg-emerald-500/20 text-emerald-400 border-0">TP1</Badge>}
           {trade.tp2Hit && <Badge className="text-[9px] h-3.5 px-1 bg-emerald-500/20 text-emerald-400 border-0">TP2</Badge>}
           {trade.tp3Hit && <Badge className="text-[9px] h-3.5 px-1 bg-emerald-500/20 text-emerald-400 border-0">TP3</Badge>}
+          {trade.beHit && <Badge className="text-[9px] h-3.5 px-1 bg-amber-500/20 text-amber-400 border-0">BE</Badge>}
           {trade.slHit && <Badge className="text-[9px] h-3.5 px-1 bg-rose-500/20 text-rose-400 border-0">SL</Badge>}
         </div>
       </div>
@@ -151,9 +152,9 @@ function TradeCard({ trade }: { trade: any }) {
       </div>
       {!isOpen && result && (
         <p className="text-[10px] mt-1.5 text-slate-500">
-          Result: <span className={result === "SL" ? "text-rose-400" : "text-emerald-400"}>{result}</span>
-          {trade.slHitAt || trade.tp3HitAt || trade.tp2HitAt || trade.tp1HitAt
-            ? ` · ${new Date(trade.slHitAt || trade.tp3HitAt || trade.tp2HitAt || trade.tp1HitAt).toLocaleString()}`
+          Result: <span className={result === "SL" ? "text-rose-400" : result === "BE" ? "text-amber-400" : "text-emerald-400"}>{result}</span>
+          {trade.beHitAt || trade.slHitAt || trade.tp3HitAt || trade.tp2HitAt || trade.tp1HitAt
+            ? ` · ${new Date(trade.beHitAt || trade.slHitAt || trade.tp3HitAt || trade.tp2HitAt || trade.tp1HitAt).toLocaleString()}`
             : ""}
         </p>
       )}
