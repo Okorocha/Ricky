@@ -983,7 +983,6 @@ export async function scanFVGs(
   }
 
   const price = priceData.price;
-  const spread = priceData.spread;
   const { session, priority } = getSessionInfo();
   let count = 0;
 
