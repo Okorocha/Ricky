@@ -1,6 +1,18 @@
 import { db } from "@workspace/db";
 import { signals, activeSetups, activeTrades, telegramLog } from "@workspace/db";
 import { eq, and, desc, gte } from "drizzle-orm";
+import {
+  getRegimeParams,
+  type RegimeParams,
+  type MarketRegime,
+  scaleThreshold,
+  dynamicSLFloor,
+  dynamicSpreadMax,
+  dynamicRRTargets,
+  dynamicVelocityThresholds,
+  dynamicSpreadBands,
+} from "./regime";
+import type { OHLCCandle } from "./regime";
 
 const TOKEN = process.env.TELEGRAM_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
@@ -126,14 +138,6 @@ function getPriceContext(): {
 
 // ── Twelve Data OHLC Fetching (real-time XAU/USD spot) ───────────────────────
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_API_KEY || "";
-
-interface OHLCCandle {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
 
 // interval examples: "1min", "5min", "1h", "1day"
 async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promise<OHLCCandle[]> {
@@ -342,41 +346,52 @@ export async function ensureLevelsRefreshed(): Promise<void> {
   }
 }
 
-function getZoneThreshold(tier: string): { entering: number; atLevel: number; sweep: number } {
-  switch (tier) {
-    case "major": return { entering: 10.0, atLevel: 3.0, sweep: 1.5 };
-    case "key":   return { entering: 8.0,  atLevel: 2.5, sweep: 1.2 };
-    default:      return { entering: 6.0,  atLevel: 2.0, sweep: 1.0 };
-  }
+// ── DYNAMIC Zone Thresholds (regime-aware) ──────────────────────────────────
+// Original hardcoded: major={entering:10, atLevel:3, sweep:1.5}
+// Now scales with regime ATR — ranging zones are tighter, trending wider.
+
+function getZoneThreshold(tier: string, regime: RegimeParams): { entering: number; atLevel: number; sweep: number } {
+  // Base thresholds (original hardcoded values)
+  const base: Record<string, { entering: number; atLevel: number; sweep: number }> = {
+    major: { entering: 10.0, atLevel: 3.0, sweep: 1.5 },
+    key:   { entering: 8.0,  atLevel: 2.5, sweep: 1.2 },
+  };
+  const def = base[tier] ?? { entering: 6.0, atLevel: 2.0, sweep: 1.0 };
+
+  // Scale thresholds proportionally to regime
+  return {
+    entering:  scaleThreshold(def.entering, regime),
+    atLevel:   scaleThreshold(def.atLevel, regime),
+    sweep:     scaleThreshold(def.sweep, regime),
+  };
 }
 
+// ── 5m Structure Detection (unchanged logic) ────────────────────────────────
 function get5mStructure(candles: OHLCCandle[]): "bullish" | "bearish" | "neutral" {
   if (candles.length < 10) return "neutral";
-  
+
   const recent = candles.slice(-20);
   const highs = recent.map(c => c.high);
   const lows = recent.map(c => c.low);
-  
-  // Simple BoS (Break of Structure) detection
+
   const lastHigh = Math.max(...highs.slice(-10, -2));
   const lastLow = Math.min(...lows.slice(-10, -2));
-  
+
   const currentHigh = Math.max(...highs.slice(-2));
   const currentLow = Math.min(...lows.slice(-2));
-  
+
   if (currentHigh > lastHigh) return "bullish";
   if (currentLow < lastLow) return "bearish";
-  
-  // Fallback to Higher Highs / Lower Lows
+
   let hh = 0, ll = 0;
   for (let i = 1; i < recent.length; i++) {
     if (recent[i]!.high > recent[i-1]!.high) hh++;
     if (recent[i]!.low < recent[i-1]!.low) ll++;
   }
-  
+
   if (hh > ll + 3) return "bullish";
   if (ll > hh + 3) return "bearish";
-  
+
   return "neutral";
 }
 
@@ -396,7 +411,8 @@ function detectCandleSignal(
   zoneDist: number,
   zoneStatus: string,
   direction: "LONG" | "SHORT",
-  candles: OHLCCandle[] = []
+  candles: OHLCCandle[] = [],
+  regime: RegimeParams
 ): CandleSignal {
   const isLong = direction === "LONG";
 
@@ -456,7 +472,9 @@ function detectCandleSignal(
     // ── Rejection wick (any candle with a wick back into zone) ──────────────
     if (range > 0) {
       const rejectionWick = isLong ? lowerWick / range : upperWick / range;
-      if (rejectionWick >= 0.4 && zoneDist <= 4) {
+      // Dynamic rejection distance: scales with ATR
+      const dynamicRejectDist = scaleThreshold(4.0, regime);
+      if (rejectionWick >= 0.4 && zoneDist <= dynamicRejectDist) {
         return { pattern: "rejection", strength: "moderate", confirmed: true };
       }
     }
@@ -473,15 +491,18 @@ function detectCandleSignal(
     return { pattern: "weak", strength: "weak", confirmed: false };
   }
 
-  // ── Velocity fallback (no candle data) ───────────────────────────────────
+  // ── Velocity fallback (no candle data) — DYNAMIC thresholds ─────────────
   const ctx = getPriceContext();
-  const spreadActive   = spread > 2.0;
-  const spreadModerate = spread >= 1.0 && spread <= 2.0;
-  const spreadQuiet    = spread < 1.0;
-  const veryClose      = zoneDist <= 1.5;
-  const closeToZone    = zoneDist <= 3.5;
-  const velocityReverts = isLong ? ctx.velocity > 0.05 : ctx.velocity < -0.05;
-  const strongMomentum  = Math.abs(ctx.velocity) > 0.15 && ctx.consistent;
+  const bands = dynamicSpreadBands(regime);
+  const velThresh = dynamicVelocityThresholds(regime);
+
+  const spreadActive   = spread > bands.active;
+  const spreadModerate = spread >= bands.moderateMin && spread <= bands.active;
+  const spreadQuiet    = spread < bands.moderateMin;
+  const veryClose      = zoneDist <= scaleThreshold(1.5, regime);
+  const closeToZone    = zoneDist <= scaleThreshold(3.5, regime);
+  const velocityReverts = isLong ? ctx.velocity > velThresh.revertMin : ctx.velocity < -velThresh.revertMin;
+  const strongMomentum  = Math.abs(ctx.velocity) > velThresh.strongMomentum && ctx.consistent;
 
   if (zoneStatus === "SWEEP") {
     if (spreadActive && veryClose && velocityReverts) return { pattern: "pin_bar",   strength: "strong",   confirmed: true };
@@ -508,7 +529,8 @@ function detectCandleSignal(
 
 // ── Market Structure Analysis ────────────────────────────────────────────────
 async function analyzeMarketStructure(
-  priceData: { price: number; spread: number }
+  priceData: { price: number; spread: number },
+  regime: RegimeParams
 ): Promise<{
   htfBias: "bullish" | "bearish" | "neutral";
   h1Bias: "bullish" | "bearish" | "neutral";
@@ -522,7 +544,7 @@ async function analyzeMarketStructure(
     getRecentFiveMinuteCandles(),
     fetchTwelveDataOHLC("1h", 20).catch(() => [])
   ]);
-  
+
   const htfBias = get5mStructure(fiveMinCandles);
   const h1Bias = hourlyCandles.length >= 5 ? get5mStructure(hourlyCandles) : "neutral";
   const ctx = getPriceContext();
@@ -534,10 +556,13 @@ async function analyzeMarketStructure(
     if (dist < nearestDist) nearestDist = dist;
   }
 
-  const pullbackEnding = ctx.tickCount >= 3 && ctx.consistent && nearestDist < 5;
+  // Dynamic pullback ending threshold
+  const dynamicNearest = scaleThreshold(5.0, regime);
+  const pullbackEnding = ctx.tickCount >= 3 && ctx.consistent && nearestDist < dynamicNearest;
   let momentum: "strong" | "moderate" | "weak" = "weak";
-  if (Math.abs(ctx.velocity) > 0.2 && ctx.consistent) momentum = "strong";
-  else if (Math.abs(ctx.velocity) > 0.08 || spread > 1.5) momentum = "moderate";
+  const velThresh = dynamicVelocityThresholds(regime);
+  if (Math.abs(ctx.velocity) > velThresh.strongMomentum && ctx.consistent) momentum = "strong";
+  else if (Math.abs(ctx.velocity) > velThresh.revertMin || spread > dynamicSpreadMax(regime) * 0.75) momentum = "moderate";
 
   return { htfBias, h1Bias, pullbackEnding, momentum };
 }
@@ -546,7 +571,7 @@ export function getSessionInfo(): { session: string; priority: string; note: str
   const now = new Date();
   const hour = now.getUTCHours();
   const min = now.getUTCMinutes();
-  
+
   // More precise session mapping (UTC)
   if (hour >= 0 && hour < 8)   return { session: "Asian Session",       priority: "LOW",    note: "Range-bound, watch Asian H/L sweeps" };
   if (hour >= 8 && hour < 12)  return { session: "London Open",          priority: "HIGH",   note: "High volatility, trend starts" };
@@ -563,20 +588,20 @@ export function isNewsSafe(): { safe: boolean; message: string } {
 
   // Weekend
   if (day === 0 || day === 6) return { safe: false, message: "Market Closed" };
-  
+
   // Friday Close (Avoid holding over weekend)
   if (day === 5 && hour >= 20) return { safe: false, message: "Friday Market Close approaching" };
 
   // Hardcoded High-Impact Events (UTC)
   // FOMC (Usually Wed 18:00 or 19:00 UTC)
   if (day === 3 && hour >= 17 && hour <= 20) return { safe: false, message: "FOMC Window — Extreme Volatility" };
-  
+
   // NFP (First Friday of month 12:30 or 13:30 UTC)
   if (day === 5 && date <= 7 && hour >= 12 && hour <= 15) return { safe: false, message: "NFP Window — NO TRADES" };
-  
+
   // CPI / PPI (Mid-month 12:30 UTC)
   if (date >= 10 && date <= 16 && hour >= 12 && hour <= 14) return { safe: false, message: "Inflation Data Window — Caution" };
-  
+
   return { safe: true, message: "No news events — safe to trade" };
 }
 
@@ -662,7 +687,7 @@ export function formatSignal(
   entry: number, sl: number, slDist: number,
   tp1: number, tp2: number, tp3: number,
   currentPrice: number, session: string, priority: string,
-  reason: string, status: string
+  reason: string, status: string, regime: string, regimeDesc: string
 ): string {
   const isLong = direction.includes("LONG");
   const arrow = isLong ? "🟢" : "🔴";
@@ -673,7 +698,8 @@ export function formatSignal(
 <b>Zone:</b> ${zoneLabel} (${status === "SWEEP" ? "Liquidity Sweep" : "At Level"})
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
 <b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-<b>Session:</b> ${sessionShort} (${priority})`;
+<b>Session:</b> ${sessionShort} (${priority})
+<b>Regime:</b> ${regime} — ${regimeDesc}`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -726,19 +752,20 @@ async function getTradeConstraints(): Promise<{
   return { blockedDirections, blockedZoneKeys };
 }
 
-// ── Calculate TP/SL from zone level ─────────────────────────────────────────
-// SL minimum is dynamic per zone type:
-//   Swing High/Low sweeps = tight (6 pts) — high-precision entry
-//   Daily S/R levels = medium (8 pts) — standard zones
-//   Pivot/Round Numbers = wide (12 pts) — noisy zones need more room
+// ── DYNAMIC Calculate TP/SL from zone level ─────────────────────────────────
+// ALL parameters now regime-aware:
+//   SL floor = ATR * regime_multiplier (not hardcoded 6/8/12)
+//   ATR buffer = 60% of avg candle range (kept from original)
+//   R:R targets scale with regime (ranging=tight, trending=wide)
 function calculateLevels(
   direction: "LONG" | "SHORT",
   zonePrice: number,
   spread: number,
   zoneKey: string,
-  recentCandles: OHLCCandle[] = []
+  recentCandles: OHLCCandle[] = [],
+  regime: RegimeParams
 ): { entry: number; sl: number; slDistance: number; tp1: number; tp2: number; tp3: number } {
-  // Dynamic ATR-based buffer from recent candle ranges
+  // Dynamic ATR-based buffer from recent candle ranges (kept from original)
   let atrBuffer = 0;
   if (recentCandles.length >= 5) {
     const last5 = recentCandles.slice(-5);
@@ -746,15 +773,8 @@ function calculateLevels(
     atrBuffer = avgRange * 0.6; // 60% of avg candle range
   }
 
-  // Dynamic SL floor based on zone precision
-  let slMin: number;
-  if (zoneKey.startsWith("sh") || zoneKey.startsWith("sl") || zoneKey.startsWith("asian")) {
-    slMin = 6.0; // Swing H/L sweeps are high-precision — tight SL OK
-  } else if (zoneKey.startsWith("s") || zoneKey.startsWith("r")) {
-    slMin = 8.0; // Daily support/resistance — standard
-  } else {
-    slMin = 12.0; // Pivot points & round numbers — noisy, need wide room
-  }
+  // DYNAMIC SL floor — replaces hardcoded 6/8/12
+  const slMin = dynamicSLFloor(regime, zoneKey);
 
   const slBuffer = Math.max(spread * 4, atrBuffer, slMin);
   const isLong = direction === "LONG";
@@ -765,10 +785,11 @@ function calculateLevels(
   const sl = isLong ? zonePrice - slBuffer : zonePrice + slBuffer;
   const slDistance = Math.abs(entry - sl);
 
-  // R:R 1.5/2.5/4.0 — quality setups only, let runners run
-  const tp1 = isLong ? entry + slDistance * 1.5 : entry - slDistance * 1.5;
-  const tp2 = isLong ? entry + slDistance * 2.5 : entry - slDistance * 2.5;
-  const tp3 = isLong ? entry + slDistance * 4.0 : entry - slDistance * 4.0;
+  // DYNAMIC R:R targets — scales with regime
+  const rr = dynamicRRTargets(regime);
+  const tp1 = isLong ? entry + slDistance * rr.tp1 : entry - slDistance * rr.tp1;
+  const tp2 = isLong ? entry + slDistance * rr.tp2 : entry - slDistance * rr.tp2;
+  const tp3 = isLong ? entry + slDistance * rr.tp3 : entry - slDistance * rr.tp3;
 
   return { entry, sl, slDistance, tp1, tp2, tp3 };
 }
@@ -776,14 +797,28 @@ function calculateLevels(
 // ── Scan Zones ───────────────────────────────────────────────────────────────
 // Only fires on AT_LEVEL and SWEEP — never on ENTERING.
 // Emits at most ONE signal per scan (the closest, strongest setup).
-// Signal goes directly to activeTrades for TP/SL monitoring — no confirmation step.
+// Signal goes directly to activeSetups for TP/SL monitoring — no confirmation step.
 export async function scanZones(priceData: { price: number; bid: number; ask: number; spread: number; source: string }): Promise<ScanResult> {
   const price = priceData.price;
   const spread = priceData.spread;
 
-  // Fix 4: Spread Cap (2.0 pts = 20 pips on Gold)
-  if (spread > 2.0) {
-    return { setupFound: false, count: 0, reason: `Spread too wide (${spread.toFixed(2)})` };
+  // Fetch 5m candles first to compute regime
+  const recentCandles = await getRecentFiveMinuteCandles();
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+
+  // DYNAMIC: Compute regime params
+  const regime = getRegimeParams(recentCandles, hourlyCandles);
+
+  // DYNAMIC: Spread cap scales with regime
+  const maxSpread = dynamicSpreadMax(regime);
+  if (spread > maxSpread) {
+    return { setupFound: false, count: 0, reason: `Spread too wide (${spread.toFixed(2)}) — regime max ${maxSpread.toFixed(2)}` };
+  }
+
+  // DYNAMIC: Choppy/no-trade regime blocks all signals
+  if (regime.noTrade) {
+    console.log("[Bot] Regime no-trade — choppy market with low volatility");
+    return { setupFound: false, count: 0, reason: `No-trade regime — ${regime.description}` };
   }
 
   const { safe, message: newsMsg } = isNewsSafe();
@@ -797,9 +832,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   if (Date.now() - lastZoneStatsRefresh > ZONE_STATS_REFRESH_INTERVAL) {
     await refreshZoneWinRate();
   }
-  const recentCandles = await getRecentFiveMinuteCandles(); // Use 5m for less noise
+
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
-  const marketStructure = await analyzeMarketStructure(priceData);
+  const marketStructure = await analyzeMarketStructure(priceData, regime);
   const { session, priority } = getSessionInfo();
 
   let cooldownRejected = 0;
@@ -816,41 +851,29 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   for (const [key, level] of Object.entries(LEVELS)) {
     const dist = Math.abs(price - level.price);
-    const thresh = getZoneThreshold(level.tier);
+    // DYNAMIC: Zone thresholds scale with regime
+    const thresh = getZoneThreshold(level.tier, regime);
     let direction: "LONG" | "SHORT";
     if (key.startsWith("sh") || key.startsWith("asian_high")) {
-      // Swing Highs and Asian Highs are ALWAYS resistance → SHORT
       direction = "SHORT";
     } else if (key.startsWith("sl") || key.startsWith("asian_low")) {
-      // Swing Lows and Asian Lows are ALWAYS support → LONG
       direction = "LONG";
     } else if (key.startsWith("s") && !key.startsWith("sh") && !key.startsWith("sl")) {
-      // Daily Supports (s1, s2, s3) → support → LONG
       direction = "LONG";
     } else if (key.startsWith("r")) {
-      // Daily Resistances (r1, r2, r3) → resistance → SHORT
       direction = "SHORT";
     } else {
-      // Pivot Point (pp) or Round Numbers (rnd)
-      // If price is above, it acts as support (LONG). If below, resistance (SHORT).
       direction = price > level.price ? "LONG" : "SHORT";
     }
 
-    // Skip broken levels: if price has already blown through a swing high/low,
-    // that zone is no longer valid resistance/support until price retraces.
-    if ((key.startsWith("sh") || key.startsWith("asian_high")) && price > level.price) {
-      continue; // price already above swing high — not valid resistance
-    }
-    if ((key.startsWith("sl") || key.startsWith("asian_low")) && price < level.price) {
-      continue; // price already below swing low — not valid support
-    }
+    // Skip broken levels
+    if ((key.startsWith("sh") || key.startsWith("asian_high")) && price > level.price) continue;
+    if ((key.startsWith("sl") || key.startsWith("asian_low")) && price < level.price) continue;
 
     // Only fire when price is AT the level or sweeping through it
     let status: string | null = null;
     if (dist <= thresh.sweep)   status = "SWEEP";
     else if (dist <= thresh.atLevel) status = "AT_LEVEL";
-    // ENTERING is intentionally skipped — those signals arrive before price
-    // has confirmed anything and most of them get cancelled.
 
     if (!status) continue;
 
@@ -859,20 +882,16 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     const dir = direction.includes("LONG") ? "LONG" : "SHORT";
     if (blockedDirections.has(dir)) { constraintRejected++; continue; }
 
-    const candle = detectCandleSignal(price, spread, dist, status, direction, recentCandles);
+    // DYNAMIC: Candle detection now regime-aware
+    const candle = detectCandleSignal(price, spread, dist, status, direction, recentCandles, regime);
     if (!candle.confirmed) { candleRejected++; continue; }
 
     // Fix 2: Skip weak candles during low-priority (Asian) session
     if (priority === "LOW" && candle.strength === "weak") { candleRejected++; continue; }
 
     // Fix 7: Swing High/Low zones require SWEEP status + strong candle
-    // AT_LEVEL on swing highs/lows has low precision — price often just passes through
-    if ((key.startsWith("sh") || key.startsWith("sl")) && status !== "SWEEP") {
-      continue;
-    }
-    if ((key.startsWith("sh") || key.startsWith("sl")) && candle.strength === "weak") {
-      continue;
-    }
+    if ((key.startsWith("sh") || key.startsWith("sl")) && status !== "SWEEP") continue;
+    if ((key.startsWith("sh") || key.startsWith("sl")) && candle.strength === "weak") continue;
 
     // Fix 5: Zone Win-Rate Filter — skip zones with < 35% win rate (need ≥3 trades)
     const wr = getZoneWinRate(key);
@@ -895,10 +914,10 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   // Confluence: Check if any qualified zone aligns with an active FVG
   const confluenceZones = qualified.map(z => {
-    const hasFVG = fvgCache.fvgs.some(f => 
-      f.direction === z.type && 
-      ((z.type === "LONG" && Math.abs(z.price - f.low) < 3) || 
-       (z.type === "SHORT" && Math.abs(z.price - f.high) < 3))
+    const hasFVG = fvgCache.fvgs.some(f =>
+      f.direction === z.type &&
+      ((z.type === "LONG" && Math.abs(z.price - f.low) < scaleThreshold(3.0, regime)) ||
+       (z.type === "SHORT" && Math.abs(z.price - f.high) < scaleThreshold(3.0, regime)))
     );
     return { ...z, hasFVG };
   });
@@ -906,11 +925,11 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   // Pick single best: SWEEP > AT_LEVEL, then Confluence, then distance, then candle strength
   const strengthScore = (c: CandleSignal) => (c.strength === "strong" ? 3 : c.strength === "moderate" ? 2 : 1);
   const statusScore = (s: string) => {
-    if (s === "SWEEP") return 3; // Priority 1: Liquidity Sweeps
+    if (s === "SWEEP") return 3;
     if (s === "AT_LEVEL") return 2;
     return 1;
   };
-  
+
   confluenceZones.sort((a, b) =>
     statusScore(b.status) - statusScore(a.status) ||
     (b.hasFVG ? 1 : 0) - (a.hasFVG ? 1 : 0) ||
@@ -920,7 +939,6 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   const zone = confluenceZones[0]!;
 
   // Scalper-Friendly Filter: Only hard-block if it opposes the immediate 5m structure.
-  // The 1h structure is used for priority, not for blocking.
   const biasAligned5m =
     (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
     (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
@@ -930,35 +948,32 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   }
 
   // Confluence & Trend Alignment check for A+ status
-  const h1Aligned = 
+  const h1Aligned =
     (zone.type === "LONG" && marketStructure.h1Bias !== "bearish") ||
     (zone.type === "SHORT" && marketStructure.h1Bias !== "bullish");
 
-  // Special Logic: Confluence, Asian Sweeps, or Full Trend Alignment (5m+1h) are A+ setups
   const isAsianSweep = zone.key.includes("asian") && zone.status === "SWEEP";
   const priorityScore = (isAsianSweep || zone.hasFVG || (biasAligned5m && h1Aligned)) ? "A+" : priority;
-  const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, zone.key, recentCandles);
-  
+  const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, zone.key, recentCandles, regime);
+
   // Check if SL is already breached by current price
   const isLong = zone.type === "LONG";
   const slBreached = isLong ? price <= sl : price >= sl;
-  
+
   const baseReason = zone.status === "SWEEP"
     ? `Liquidity sweep at ${zone.label} — ${zone.candle.pattern} reversal (${zone.candle.strength})`
     : `Price AT ${zone.label} — ${zone.candle.pattern} signal (${zone.candle.strength})`;
-  // Include zone win-rate in the reason for transparency
   const wrStats = zoneWinRate.get(zone.key);
   const wrText = wrStats && wrStats.wins + wrStats.losses >= 2
     ? ` [WR: ${(wrStats.wins / (wrStats.wins + wrStats.losses) * 100).toFixed(0)}% | ${wrStats.wins}W/${wrStats.losses}L]`
     : "";
   const fullReason = baseReason + (zone.hasFVG ? " [FVG CONFLUENCE]" : "") + wrText;
 
-  // Fix 6: Reject setups where SL distance is below zone-type minimum
-  const slMinForZone = zone.key.startsWith("sh") || zone.key.startsWith("sl") || zone.key.startsWith("asian")
-    ? 5.0 : zone.key.startsWith("s") || zone.key.startsWith("r") ? 7.0 : 10.0;
+  // DYNAMIC: SL distance minimum scales with regime ATR
+  const slMinForZone = dynamicSLFloor(regime, zone.key) * 0.8; // 80% of SL floor to allow
   if (slDistance < slMinForZone) {
-    console.log(`[Bot] Skipping ${zone.key} — SL distance ${slDistance.toFixed(1)} below zone minimum ${slMinForZone}`);
-    return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — needs ≥${slMinForZone} pts for ${zone.key}` };
+    console.log(`[Bot] Skipping ${zone.key} — SL distance ${slDistance.toFixed(1)} below regime minimum ${slMinForZone.toFixed(1)} (regime: ${regime.regime}, ATR: $${regime.atr.toFixed(2)})`);
+    return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — regime ${regime.regime} requires ≥${slMinForZone.toFixed(1)} pts` };
   }
 
   if (slBreached) {
@@ -975,7 +990,7 @@ Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
 
   markZoneCooldown(zone.key);
 
-  // Log to signals table
+  // Log
   try {
     await db.insert(signals).values({
       direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
@@ -1008,7 +1023,8 @@ Action: Do NOT enter. Switch bias to ${isLong ? "SHORT" : "LONG"}.`;
 
   // Append win-rate to signal if available
   const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
-  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status) + wrAppend;
+  // DYNAMIC: Signal now includes regime info
+  const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priorityScore, fullReason, zone.status, regime.regime, regime.description) + wrAppend;
   await sendTelegram(msg, "signal");
 
   return { setupFound: true, count: 1, reason: fullReason };
@@ -1028,8 +1044,8 @@ export async function trackActiveTrades(price: number) {
         if (tp1Reached) {
           // Update SL to entry price (Break-Even) in DB
           await db.update(activeTrades)
-            .set({ 
-              tp1Hit: true, 
+            .set({
+              tp1Hit: true,
               tp1HitAt: new Date(),
               sl: trade.entry // MOVE SL TO BE
             })
@@ -1062,7 +1078,7 @@ export async function trackActiveTrades(price: number) {
           await db.update(activeTrades)
             .set({ slHit: true, slHitAt: new Date(), closed: true })
             .where(eq(activeTrades.id, trade.id));
-          
+
           if (isBE) {
             await sendTelegram(formatBEHit(trade, price), "be_hit");
           } else {
@@ -1097,8 +1113,8 @@ export async function expireStaleSetups(price: number) {
           ? "Price broke through the stop loss level."
           : "Setup expired (30 min timeout)";
         const arrow = isLong ? "🟢" : "🔴";
-        
-        const cancelMsg = slBreached 
+
+        const cancelMsg = slBreached
           ? `<b>⚠️ SETUP CANCELLED</b>
 Entry: $${setup.entry.toFixed(2)}
 SL: $${setup.sl.toFixed(2)}
@@ -1123,9 +1139,7 @@ interface FVG {
   low: number;
   direction: "LONG" | "SHORT";
   formTime: number;
-  /** Extreme of the candle that created (anchored) the FVG — structural invalidation level.
-   *  Bullish FVG → c1.low  (below here the gap is fully invalidated)
-   *  Bearish FVG → c1.high (above here the gap is fully invalidated) */
+  /** Extreme of the candle that created (anchored) the FVG — structural invalidation level. */
   invalidationExtreme: number;
 }
 
@@ -1134,28 +1148,21 @@ const FVG_CACHE_TTL = 2 * 60 * 1000; // refresh every 2 minutes
 
 function isLondonOrNYSession(): boolean {
   const hour = new Date().getUTCHours();
-  // London Open 08-12, London-NY overlap 13-16, NY session 16-20
   return (hour >= 8 && hour < 12) || (hour >= 13 && hour < 20);
 }
 
 function detectFVGs(candles: OHLCCandle[]): FVG[] {
   const fvgs: FVG[] = [];
-  // FVG = 3-candle pattern: gap between candle[i] and candle[i+2]
   for (let i = 0; i < candles.length - 2; i++) {
     const c1 = candles[i]!;
     const c3 = candles[i + 2]!;
-    // Bullish FVG: c3.low > c1.high — upward imbalance, expect bullish retrace entry
-    // Invalidation extreme = c1.low (the wick that anchored the bottom of the gap)
     if (c3.low > c1.high) {
       fvgs.push({ high: c3.low, low: c1.high, direction: "LONG", formTime: c3.time, invalidationExtreme: c1.low });
     }
-    // Bearish FVG: c1.low > c3.high — downward imbalance, expect bearish retrace entry
-    // Invalidation extreme = c1.high (the wick that anchored the top of the gap)
     if (c1.low > c3.high) {
       fvgs.push({ high: c1.low, low: c3.high, direction: "SHORT", formTime: c3.time, invalidationExtreme: c1.high });
     }
   }
-  // Keep only gaps formed within the last 4 hours
   const cutoff = Date.now() - 4 * 60 * 60 * 1000;
   return fvgs.filter(f => f.formTime > cutoff);
 }
@@ -1164,8 +1171,16 @@ export async function scanFVGs(
   priceData: { price: number; spread: number }
 ): Promise<ScanResult> {
   const spread = priceData.spread;
-  if (spread > 2.0) {
-    return { setupFound: false, count: 0, reason: "FVG: spread too wide" };
+
+  // Fetch candles for regime computation
+  const candles5m = await getRecentFiveMinuteCandles();
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+  const regime = getRegimeParams(candles5m, hourlyCandles);
+
+  // DYNAMIC: Spread cap scales with regime
+  const maxSpread = dynamicSpreadMax(regime);
+  if (spread > maxSpread) {
+    return { setupFound: false, count: 0, reason: "FVG: spread too wide for current regime" };
   }
 
   if (!isLondonOrNYSession()) {
@@ -1193,39 +1208,44 @@ export async function scanFVGs(
   let count = 0;
 
   for (const fvg of fvgCache.fvgs) {
-    // Signal fires when price retraces into the gap zone
     const inGap = price >= fvg.low && price <= fvg.high;
     if (!inGap) continue;
 
-    // Minimum gap size filter — 2.0 is a good balance for Gold scalping (20 pips)
+    // DYNAMIC: Minimum gap size scales with regime ATR
+    // Original hardcoded 2.0 → now ATR * 0.6 (minimum to filter noise)
+    const minGapSize = Math.max(1.5, regime.atr * 0.6);
     const gapSize = fvg.high - fvg.low;
-    if (gapSize < 2.0) continue;
+    if (gapSize < minGapSize) continue;
 
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     // Confluence Check: Is this FVG near a Daily Level?
-    const nearDaily = Object.values(LEVELS).some(l => 
-      Math.abs(l.price - (fvg.direction === "LONG" ? fvg.low : fvg.high)) < 3
+    const confluenceDist = scaleThreshold(3.0, regime);
+    const nearDaily = Object.values(LEVELS).some(l =>
+      Math.abs(l.price - (fvg.direction === "LONG" ? fvg.low : fvg.high)) < confluenceDist
     );
 
-    // SL at the structural invalidation extreme of the candle that created the FVG
+    // DYNAMIC: SL uses regime-aware floor instead of hardcoded 8.0
     const spreadBuffer = spread * 1.5;
+    const slFloor = dynamicSLFloor(regime, zoneKey);
     let entry: number, sl: number, tp1: number, tp2: number, tp3: number;
     if (fvg.direction === "LONG") {
-      entry = fvg.low + 0.5; // Use fixed offset for consistency
-      sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - 8.0);
+      entry = fvg.low + 0.5;
+      sl = Math.min(fvg.invalidationExtreme - spreadBuffer, entry - slFloor);
       const slDist = entry - sl;
-      tp1 = entry + slDist * 1.5;
-      tp2 = entry + slDist * 2.5;
-      tp3 = entry + slDist * 4.0;
+      const rr = dynamicRRTargets(regime);
+      tp1 = entry + slDist * rr.tp1;
+      tp2 = entry + slDist * rr.tp2;
+      tp3 = entry + slDist * rr.tp3;
     } else {
       entry = fvg.high - 0.5;
-      sl = Math.max(fvg.invalidationExtreme + spreadBuffer, entry + 8.0);
+      sl = Math.max(fvg.invalidationExtreme + spreadBuffer, entry + slFloor);
       const slDist = sl - entry;
-      tp1 = entry - slDist * 1.5;
-      tp2 = entry - slDist * 2.5;
-      tp3 = entry - slDist * 4.0;
+      const rr = dynamicRRTargets(regime);
+      tp1 = entry - slDist * rr.tp1;
+      tp2 = entry - slDist * rr.tp2;
+      tp3 = entry - slDist * rr.tp3;
     }
 
     markZoneCooldown(zoneKey);
@@ -1238,7 +1258,8 @@ export async function scanFVGs(
 		<b>Zone:</b> FVG Imbalance $${fvg.low.toFixed(2)}–$${fvg.high.toFixed(2)} (${gapSize.toFixed(2)} pts)
 		<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
 		<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}
-		<b>Session:</b> ${session} (${nearDaily ? "A+" : priority})`;
+		<b>Session:</b> ${session} (${nearDaily ? "A+" : priority})
+		<b>Regime:</b> ${regime.regime} — ${regime.description}`;
 
     await sendTelegram(msg, "fvg_signal");
 
@@ -1321,6 +1342,11 @@ export async function handleTelegramUpdates() {
         await handleCloseAllCommand();
         continue;
       }
+      // NEW: Regime check command
+      if (text === "REGIME") {
+        await handleRegimeCommand();
+        continue;
+      }
     }
   } catch (err) {
     console.error("[Bot] handleTelegramUpdates error:", err);
@@ -1334,9 +1360,16 @@ async function handleAliveCommand() {
   const { session, priority } = getSessionInfo();
   const { safe, message: newsMsg } = isNewsSafe();
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
+
+  // Compute current regime
+  const recentCandles = await getRecentFiveMinuteCandles();
+  const regime = getRegimeParams(recentCandles);
+
   const msg = `<b>✅ Bot Alive</b>
-	XAU/USD: ${priceStatus}
-	Session: ${session} (${priority})
+XAU/USD: ${priceStatus}
+Session: ${session} (${priority})
+Regime: ${regime.regime} — ${regime.description}
+ATR(14): $${regime.atr.toFixed(2)} | Scale: ${regime.scale.toFixed(2)}x
 News: ${safe ? "✅ Safe" : "⚠️ " + newsMsg}
 Open Trades: ${openTrades.length}
 Time: ${new Date().toISOString()}`;
@@ -1428,14 +1461,43 @@ I will alert you when TP/SL is hit.`;
   await sendTelegram(msg, "confirmed");
 }
 
+// DYNAMIC: New REGIME command for Telegram
+async function handleRegimeCommand() {
+  const data = await fetchGoldData();
+  const price = data?.price || 0;
+  const recentCandles = await getRecentFiveMinuteCandles();
+  const hourlyCandles = await fetchTwelveDataOHLC("1h", 50).catch(() => []);
+  const regime = getRegimeParams(recentCandles, hourlyCandles);
+  const rr = dynamicRRTargets(regime);
+  const slFloor = dynamicSLFloor(regime, "generic");
+  const bands = dynamicSpreadBands(regime);
+
+  const msg = `<b>📊 Market Regime Report</b>
+Regime: ${regime.regime.toUpperCase()}
+${regime.description}
+ATR(14) 5m: $${regime.atr.toFixed(2)}
+Scale: ${regime.scale.toFixed(2)}x
+Momentum: ${regime.momentum.toFixed(2)}
+Aggression: ${regime.aggression.toFixed(2)}
+No-Trade: ${regime.noTrade ? "🚫 YES" : "✅ No"}
+
+<b>Dynamic Parameters:</b>
+SL Floor: ${slFloor.toFixed(2)} pts
+Spread Max: ${dynamicSpreadMax(regime).toFixed(2)} pts
+R:R Targets: ${rr.tp1} / ${rr.tp2} / ${rr.tp3}
+Spread Bands: Active >${bands.active} | Moderate >${bands.moderateMin}
+
+XAU/USD: $${price.toFixed(2)}`;
+  await sendTelegram(msg, "regime");
+}
+
 // ── Auto-Scan Loop (3-minute interval) ─────────────────────────────────────
-// 3 min catches setups before price moves away. Cooldowns prevent duplicates.
 let autoScanInterval: ReturnType<typeof setInterval> | null = null;
 const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting auto-scan loop (15-minute interval)");
+  console.log("[Bot] Starting auto-scan loop (3-minute interval) — DYNAMIC REGIME ENGINE ACTIVE");
 
   // Run an immediate scan on startup
   (async () => {
@@ -1482,8 +1544,6 @@ export function startTradeMonitoring() {
       const priceData = await fetchGoldData();
       if (priceData) {
         await trackActiveTrades(priceData.price);
-        // expireStaleSetups removed — signals now go directly to activeTrades,
-        // so there are no pending setups that can send confusing "CANCELLED" messages.
       }
     } catch (e) {
       console.log("[Bot] Trade monitor error:", e);
