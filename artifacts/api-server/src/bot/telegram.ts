@@ -638,6 +638,13 @@ export function formatSLHit(trade: { direction: string; entry: number }, current
 Wait for next A+ setup. Do NOT revenge trade.`;
 }
 
+export function formatBEHit(trade: { direction: string; entry: number }, currentPrice: number): string {
+  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
+  return `<b>🛡️ BE HIT — $${currentPrice.toFixed(2)}</b>
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+Trade closed at Break-Even. Performance tracked.`;
+}
+
 // ── Trade Constraints ────────────────────────────────────────────────────────
 async function getTradeConstraints(): Promise<{
   blockedDirections: Set<string>;
@@ -843,7 +850,14 @@ export async function trackActiveTrades(price: number) {
       if (!trade.tp1Hit) {
         const tp1Reached = isLong ? price >= trade.tp1 : price <= trade.tp1;
         if (tp1Reached) {
-          await db.update(activeTrades).set({ tp1Hit: true, tp1HitAt: new Date() }).where(eq(activeTrades.id, trade.id));
+          // Update SL to entry price (Break-Even) in DB
+          await db.update(activeTrades)
+            .set({ 
+              tp1Hit: true, 
+              tp1HitAt: new Date(),
+              sl: trade.entry // MOVE SL TO BE
+            })
+            .where(eq(activeTrades.id, trade.id));
           await sendTelegram(formatTPHit(trade, "TP1", price), "tp_hit");
         }
       }
@@ -868,8 +882,16 @@ export async function trackActiveTrades(price: number) {
       if (!trade.slHit) {
         const slReached = isLong ? price <= trade.sl : price >= trade.sl;
         if (slReached) {
-          await db.update(activeTrades).set({ slHit: true, slHitAt: new Date(), closed: true }).where(eq(activeTrades.id, trade.id));
-          await sendTelegram(formatSLHit(trade, price), "sl_hit");
+          const isBE = trade.tp1Hit; // If TP1 was hit, this is a BE hit, not a full SL loss
+          await db.update(activeTrades)
+            .set({ slHit: true, slHitAt: new Date(), closed: true })
+            .where(eq(activeTrades.id, trade.id));
+          
+          if (isBE) {
+            await sendTelegram(formatBEHit(trade, price), "be_hit");
+          } else {
+            await sendTelegram(formatSLHit(trade, price), "sl_hit");
+          }
         }
       }
     }
