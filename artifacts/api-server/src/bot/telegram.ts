@@ -841,6 +841,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
 // ── Track Active Trades ─────────────────────────────────────────────────────
 export async function trackActiveTrades(price: number) {
+  if (price <= 0) return; // Sanity check: Never process trades with zero price
   try {
     const trades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
 
@@ -1130,12 +1131,13 @@ export async function handleTelegramUpdates() {
 async function handleAliveCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
+  const priceStatus = price > 0 ? `$${price.toFixed(2)}` : "⚠️ SOURCE DOWN";
   const { session, priority } = getSessionInfo();
   const { safe, message: newsMsg } = isNewsSafe();
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
   const msg = `<b>✅ Bot Alive</b>
-XAU/USD: $${price.toFixed(2)}
-Session: ${session} (${priority})
+	XAU/USD: ${priceStatus}
+	Session: ${session} (${priority})
 News: ${safe ? "✅ Safe" : "⚠️ " + newsMsg}
 Open Trades: ${openTrades.length}
 Time: ${new Date().toISOString()}`;
@@ -1146,6 +1148,11 @@ async function handleStatusCommand() {
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
   const data = await fetchGoldData();
   const price = data?.price || 0;
+
+  if (price <= 0) {
+    await sendTelegram(`<b>⚠️ Status Warning</b>\nPrice source currently unavailable.\nOpen Trades: ${openTrades.length}`, "status");
+    return;
+  }
 
   if (openTrades.length === 0) {
     await sendTelegram(`<b>📊 Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}`, "status");
