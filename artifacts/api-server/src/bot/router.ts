@@ -40,12 +40,18 @@ export const botRouter = router({
 
   // Manual scan trigger
   triggerScan: publicProcedure.mutation(async () => {
-    const data = await fetchGoldData();
-    if (!data) {
-      return { ok: true, setupFound: false, count: 0, reason: "No price data available", message: "No price data available" };
+    try {
+      const data = await fetchGoldData();
+      if (!data) {
+        return { ok: true, setupFound: false, count: 0, reason: "No price data available", message: "No price data available" };
+      }
+      const result = await scanZones(data);
+      return { ok: true, ...result, message: result.setupFound ? `${result.count} setup(s) found` : result.reason };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[Bot] triggerScan error:", err);
+      return { ok: false, setupFound: false, count: 0, reason: msg, message: `Scan error: ${msg}` };
     }
-    const result = await scanZones(data);
-    return { ok: true, ...result, message: result.setupFound ? `${result.count} setup(s) found` : result.reason };
   }),
 
   // Manual alive check

@@ -783,14 +783,25 @@ async function getTradeConstraints(): Promise<{
   blockedDirections: Set<string>;
   blockedZoneKeys: Set<string>;
 }> {
-  const openTrades = await db
-    .select()
-    .from(activeTrades)
-    .where(eq(activeTrades.closed, false));
-    
-  const pendingSetups = await db
-    .select()
-    .from(activeSetups);
+  let openTrades: { direction: string; zone: string }[] = [];
+  let pendingSetups: { zoneKey: string; zoneLabel: string }[] = [];
+
+  try {
+    openTrades = await db
+      .select()
+      .from(activeTrades)
+      .where(eq(activeTrades.closed, false));
+  } catch (err) {
+    console.error("[Bot] getTradeConstraints: activeTrades query failed (table may not exist yet):", err);
+  }
+
+  try {
+    pendingSetups = await db
+      .select()
+      .from(activeSetups);
+  } catch (err) {
+    console.error("[Bot] getTradeConstraints: activeSetups query failed (table may not exist yet):", err);
+  }
 
   const directionCounts = new Map<string, number>();
   const blockedZoneKeys = new Set<string>();
