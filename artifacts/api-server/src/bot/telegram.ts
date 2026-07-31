@@ -979,6 +979,14 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     if (trendCheck15m === "blocked") return null; // Hard block by 15m trend
     
     const trendCheck1h = checkSignalTrend(z.type, trend1h);
+
+    // Session-Specific Aggression:
+    // London/NY: High Frequency (Take all 15m aligned trades)
+    // Asia/Dead Zone: Conservative (A+ only: 15m + 1h aligned)
+    const isLondonNY = session.includes("London") || session.includes("NY");
+    if (!isLondonNY && trendCheck1h !== "aligned") {
+      return null; // Block non-A+ setups outside London/NY
+    }
     
     return { ...z, hasFVG, trendCheck15m, trendCheck1h };
   }).filter((z): z is NonNullable<typeof z> => z !== null);
@@ -1045,9 +1053,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     return { setupFound: false, count: 0, reason: `SL too tight (${slDistance.toFixed(1)} pts) — regime ${regime.regime} requires ≥${slMinForZone.toFixed(1)} pts` };
   }
 
-  // Safety Buffer: Don't signal if price is already too close to SL (within 25% of SL distance)
+  // Safety Buffer: Don't signal if price is already too close to SL (within 15% of SL distance)
   const proximityToSL = isLong ? (price - sl) : (sl - price);
-  const tooCloseToSL = proximityToSL < (slDistance * 0.25);
+  const tooCloseToSL = proximityToSL < (slDistance * 0.15);
 
   if (slBreached || tooCloseToSL) {
     const reason = slBreached ? "Price broke through the stop loss level." : "Price is too close to SL for a safe entry.";
@@ -1316,6 +1324,12 @@ export async function scanFVGs(
     if (trendCheck15m === "blocked") continue; // Blocked by M15 trend
     const trendCheck1h = checkSignalTrend(fvg.direction, trend1h);
 
+    // Session-Specific Aggression for FVG
+    const isLondonNY = session.includes("London") || session.includes("NY");
+    if (!isLondonNY && trendCheck1h !== "aligned") {
+      continue; // Block non-A+ FVG setups outside London/NY
+    }
+
     // Confluence Check: Is this FVG near a Daily Level?
     const confluenceDist = scaleThreshold(3.0, regime);
     const nearDaily = Object.values(LEVELS).some(l =>
@@ -1352,7 +1366,7 @@ export async function scanFVGs(
     const slDistance = Math.abs(entry - sl);
     const proximityToSL = isLong ? (price - sl) : (sl - price);
     const slBreached = isLong ? price <= sl : price >= sl;
-    if (slBreached || proximityToSL < (slDistance * 0.25)) {
+    if (slBreached || proximityToSL < (slDistance * 0.15)) {
       continue; // Skip dying FVG setups
     }
 
