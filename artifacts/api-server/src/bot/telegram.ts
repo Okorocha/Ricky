@@ -92,7 +92,7 @@ async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promis
   const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_KEY}`;
   const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
   if (resp.status !== 200) throw new Error(`Twelve Data HTTP ${resp.status}`);
-  const j = await resp.json();
+  const j = await resp.json() as { status?: string; message?: string; values?: { datetime: string; open: string; high: string; low: string; close: string }[] };
   if (j.status === "error") throw new Error(`Twelve Data: ${j.message}`);
   type TDRow = { datetime: string; open: string; high: string; low: string; close: string };
   const values: TDRow[] = j.values || [];
@@ -485,7 +485,7 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
+    const j = await resp.json() as Array<{ spreadProfilePrices: Array<{ bid: string; ask: string }> }>;
     const profiles = j?.[0]?.spreadProfilePrices || [];
     if (!profiles.length) throw new Error("no profiles");
     const bid = parseFloat(profiles[0].bid);
@@ -500,8 +500,8 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
-    const price = parseFloat(j?.items?.[0]?.xauPrice);
+    const j = await resp.json() as { items?: Array<{ xauPrice: string }> };
+    const price = parseFloat(j?.items?.[0]?.xauPrice ?? "");
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "goldprice.org" };
   };
@@ -512,8 +512,8 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
-    const price = parseFloat(j?.rates?.USD);
+    const j = await resp.json() as { rates?: { USD?: number } };
+    const price = parseFloat(String(j?.rates?.USD ?? ""));
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "frankfurter" };
   };
@@ -658,7 +658,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   for (const [key, level] of Object.entries(LEVELS)) {
     const dist = Math.abs(price - level.price);
     const thresh = getZoneThreshold(level.tier);
-    const isSupport = key.startsWith("s");
+    const isSupport = key.startsWith("s") && !key.startsWith("sh");
     const direction: "LONG" | "SHORT" = isSupport ? "LONG" : "SHORT";
 
     // Only fire when price is AT the level or sweeping through it
@@ -677,6 +677,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
     const candle = detectCandleSignal(price, spread, dist, status, direction, recentCandles);
     if (!candle.confirmed) { candleRejected++; continue; }
+
+    // Fix 2: Skip weak candles during low-priority (Asian) session
+    if (priority === "LOW" && candle.strength === "weak") { candleRejected++; continue; }
 
     qualified.push({ key, label: level.label, tier: level.tier, price: level.price, type: direction, dist, status, candle });
   }
@@ -698,6 +701,16 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     a.dist - b.dist
   );
   const zone = qualified[0]!;
+
+  // Fix 3: Filter counter-trend AT_LEVEL signals when HTF bias opposes direction
+  if (zone.status === "AT_LEVEL" && zone.candle.strength !== "strong") {
+    const biasAligned =
+      (zone.type === "LONG" && marketStructure.htfBias !== "bearish") ||
+      (zone.type === "SHORT" && marketStructure.htfBias !== "bullish");
+    if (!biasAligned) {
+      return { setupFound: false, count: 0, reason: `Counter-trend AT_LEVEL with ${zone.candle.strength} candle — HTF bias (${marketStructure.htfBias}) opposes direction` };
+    }
+  }
 
   const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread, recentCandles);
   const fullReason = zone.status === "SWEEP"
@@ -965,7 +978,7 @@ export async function handleTelegramUpdates() {
       { signal: AbortSignal.timeout(10000) }
     );
     if (resp.status !== 200) return;
-    const data = await resp.json();
+    const data = await resp.json() as { result?: Array<{ update_id: number; message?: { chat?: { id: number }; text?: string } }> };
     const updates = data.result || [];
 
     for (const update of updates) {
