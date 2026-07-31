@@ -766,11 +766,16 @@ export function formatSLHit(trade: { direction: string; entry: number }, current
 Wait for next A+ setup. Do NOT revenge trade.`;
 }
 
-export function formatBEHit(trade: { direction: string; entry: number }, currentPrice: number): string {
+export function formatBEHit(trade: { direction: string; entry: number; tp1: number; tp2Hit?: boolean }, currentPrice: number): string {
   const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
-  return `<b>🛡️ BE HIT — $${currentPrice.toFixed(2)}</b>
+  if (trade.tp2Hit) {
+    return `<b>🛡️ TRAILING STOP HIT (TP1) — $${currentPrice.toFixed(2)}</b>
 ${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
-Trade closed at Break-Even. Performance tracked.`;
+Trade closed at TP1 level after TP2 was hit. Profit secured!`;
+  }
+  return `<b>🛡️ BREAK-EVEN HIT — $${currentPrice.toFixed(2)}</b>
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+Trade closed at entry price. Performance tracked.`;
 }
 
 // ── Trade Constraints ────────────────────────────────────────────────────────
@@ -1193,6 +1198,7 @@ export async function trackActiveTrades(price: number) {
             await db.update(activeTrades)
               .set({ beHit: true, beHitAt: new Date(), closed: true })
               .where(eq(activeTrades.id, trade.id));
+            // Pass the whole trade object to handle Trailing Stop vs BE messaging
             await sendTelegram(formatBEHit(trade, price), "be_hit");
           } else {
             await db.update(activeTrades)
