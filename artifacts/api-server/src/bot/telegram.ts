@@ -732,7 +732,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
   }
 
   await ensureLevelsRefreshed();
-  const recentCandles = await getRecentMinuteCandles();
+  const recentCandles = await getRecentFiveMinuteCandles(); // Use 5m for less noise
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
   const marketStructure = await analyzeMarketStructure(priceData);
   const { session, priority } = getSessionInfo();
@@ -1077,9 +1077,9 @@ export async function scanFVGs(
     const inGap = price >= fvg.low && price <= fvg.high;
     if (!inGap) continue;
 
-    // Minimum gap size filter — tiny gaps give no room and get spread out instantly
+    // Minimum gap size filter — increased to 2.5 for less noise (higher quality gaps)
     const gapSize = fvg.high - fvg.low;
-    if (gapSize < 1.5) continue;
+    if (gapSize < 2.5) continue;
 
     const zoneKey = `fvg_${fvg.direction}_${fvg.formTime}`;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
