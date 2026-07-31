@@ -1065,36 +1065,50 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
 
   markZoneCooldown(zone.key);
 
-  // Log
-  try {
-    await db.insert(signals).values({
-      direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
-      entry, sl, slDistance, tp1, tp2, tp3,
-      currentPrice: price, session, priority: priorityScore,
-      reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
-    });
-  } catch (err) { console.error("[Bot] signals insert error:", err); }
+    // Log
+    try {
+      await db.insert(signals).values({
+        direction: zone.type, zoneLabel: zone.label, zoneTier: zone.tier,
+        entry, sl, slDistance, tp1, tp2, tp3,
+        currentPrice: price, session, priority: priorityScore,
+        reason: fullReason, status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP", zoneKey: zone.key,
+      });
+    } catch (err) { console.error("[Bot] signals insert error:", err); }
 
-  // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
-  try {
-    await db.insert(activeSetups).values({
-      zoneKey: zone.key,
-      direction: zone.type,
-      zoneLabel: zone.label,
-      zoneTier: zone.tier,
-      entry,
-      sl,
-      slDistance,
-      tp1,
-      tp2,
-      tp3,
-      currentPrice: price,
-      status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-      session,
-      priority: priorityScore,
-      detectedAt: new Date(),
-    });
-  } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
+    // Restore Confirmation Flow: Log to activeSetups instead of activeTrades
+    try {
+      // FIX: Prevent duplicate pending setups for the same zone
+      const existing = await db.select().from(activeSetups).where(eq(activeSetups.zoneKey, zone.key)).limit(1);
+      if (existing.length === 0) {
+        const [newSetup] = await db.insert(activeSetups).values({
+          zoneKey: zone.key,
+          direction: zone.type,
+          zoneLabel: zone.label,
+          zoneTier: zone.tier,
+          entry,
+          sl,
+          slDistance,
+          tp1,
+          tp2,
+          tp3,
+          currentPrice: price,
+          status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
+          session,
+          priority: priorityScore,
+          detectedAt: new Date(),
+        }).returning({ id: activeSetups.id });
+        
+        if (newSetup) {
+          lastSignaledSetupId = newSetup.id;
+          lastSignaledAt = Date.now();
+        }
+      } else {
+        console.log(`[Bot] Setup for ${zone.key} already pending, skipping duplicate insert.`);
+        // Update last signaled ID to the existing one so "In" still works
+        lastSignaledSetupId = existing[0].id;
+        lastSignaledAt = Date.now();
+      }
+    } catch (err) { console.error("[Bot] activeSetups insert error:", err); }
 
   // Append win-rate to signal if available
   const wrAppend = wrText ? `\n<b>Zone Stats:</b>${wrText}` : "";
@@ -1400,23 +1414,36 @@ export async function scanFVGs(
 
     // Restore Confirmation Flow: Log to activeSetups
     try {
-      await db.insert(activeSetups).values({
-        zoneKey,
-        direction: fvg.direction,
-        zoneLabel: `FVG ${fvg.direction} 5m`,
-        zoneTier: "key",
-        entry,
-        sl,
-        slDistance: Math.abs(entry - sl),
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        status: "AT_LEVEL",
-        session,
-        priority,
-        detectedAt: new Date(),
-      });
+      // FIX: Prevent duplicate pending setups for the same FVG
+      const existing = await db.select().from(activeSetups).where(eq(activeSetups.zoneKey, zoneKey)).limit(1);
+      if (existing.length === 0) {
+        const [newSetup] = await db.insert(activeSetups).values({
+          zoneKey,
+          direction: fvg.direction,
+          zoneLabel: `FVG ${fvg.direction} 5m`,
+          zoneTier: "key",
+          entry,
+          sl,
+          slDistance: Math.abs(entry - sl),
+          tp1,
+          tp2,
+          tp3,
+          currentPrice: price,
+          status: "AT_LEVEL",
+          session,
+          priority,
+          detectedAt: new Date(),
+        }).returning({ id: activeSetups.id });
+
+        if (newSetup) {
+          lastSignaledSetupId = newSetup.id;
+          lastSignaledAt = Date.now();
+        }
+      } else {
+        console.log(`[Bot] FVG Setup for ${zoneKey} already pending, skipping duplicate insert.`);
+        lastSignaledSetupId = existing[0].id;
+        lastSignaledAt = Date.now();
+      }
     } catch (err) { console.error("[FVG] activeSetups insert error:", err); }
   }
 
@@ -1427,6 +1454,8 @@ export async function scanFVGs(
 
 // ── Telegram Command Handler ────────────────────────────────────────────────
 let lastUpdateId = 0;
+let lastSignaledSetupId: number | null = null;
+let lastSignaledAt = 0;
 
 export async function handleTelegramUpdates() {
   try {
@@ -1545,9 +1574,28 @@ async function handleConfirmedCommand(index: number | null) {
     return;
   }
 
-  const setupToConfirm = index !== null ? setups[index] : setups[0];
+  let setupToConfirm: any = null;
+  
+  if (index !== null) {
+    setupToConfirm = setups[index];
+  } else {
+    // FIX: Prioritize the signal that was just announced to this chat
+    if (lastSignaledSetupId) {
+      setupToConfirm = setups.find(s => s.id === lastSignaledSetupId);
+      // If signal is older than 5 minutes, fallback to newest setup
+      if (Date.now() - lastSignaledAt > 5 * 60 * 1000) {
+        setupToConfirm = setups[0];
+      }
+    }
+    
+    // Fallback to the most recent setup if no specific signaled ID or it's gone
+    if (!setupToConfirm) {
+      setupToConfirm = setups[0];
+    }
+  }
+
   if (!setupToConfirm) {
-    await sendTelegram(`No setup at position ${(index ?? 0) + 1}.`, "confirmed");
+    await sendTelegram(`No setup found to confirm.`, "confirmed");
     return;
   }
 
@@ -1668,6 +1716,8 @@ export function startTradeMonitoring() {
       const priceData = await fetchGoldData();
       if (priceData) {
         await trackActiveTrades(priceData.price);
+        // FIX: Actually call the expiration logic so stale setups don't pile up
+        await expireStaleSetups(priceData.price);
       }
     } catch (e) {
       console.log("[Bot] Trade monitor error:", e);
