@@ -845,8 +845,8 @@ export async function handleTelegramUpdates() {
 
       const cmdMatch = text.match(/^IN(\s+(\d+))?$/);
       if (cmdMatch) {
-        const index = cmdMatch[2] ? parseInt(cmdMatch[2]) - 1 : null;
-        await handleConfirmedCommand(index);
+        const input = cmdMatch[2] ? parseInt(cmdMatch[2]) : null;
+        await handleConfirmedCommand(input);
         continue;
       }
       if (text === "ALIVE") {
