@@ -78,7 +78,7 @@ async function fetchYahooOHLC(interval: string, range: string): Promise<OHLCCand
     signal: AbortSignal.timeout(6000),
   });
   if (resp.status !== 200) throw new Error(`Yahoo Finance HTTP ${resp.status}`);
-  const j = await resp.json();
+  const j = await resp.json() as any;
   const result = j?.chart?.result?.[0];
   if (!result) throw new Error("No chart result");
   const timestamps: number[] = result.timestamp || [];
@@ -469,7 +469,7 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
+    const j = await resp.json() as any;
     const profiles = j?.[0]?.spreadProfilePrices || [];
     if (!profiles.length) throw new Error("no profiles");
     const bid = parseFloat(profiles[0].bid);
@@ -484,7 +484,7 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
+    const j = await resp.json() as any;
     const price = parseFloat(j?.items?.[0]?.xauPrice);
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "goldprice.org" };
@@ -496,7 +496,7 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
       { signal: AbortSignal.timeout(4000) }
     );
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json();
+    const j = await resp.json() as any;
     const price = parseFloat(j?.rates?.USD);
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "frankfurter" };
@@ -839,7 +839,7 @@ export async function handleTelegramUpdates() {
       { signal: AbortSignal.timeout(10000) }
     );
     if (resp.status !== 200) return;
-    const data = await resp.json();
+    const data = await resp.json() as any;
     const updates = data.result || [];
 
     for (const update of updates) {
