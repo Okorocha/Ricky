@@ -517,19 +517,21 @@ export function formatSignal(
   entry: number, sl: number, slDist: number,
   tp1: number, tp2: number, tp3: number,
   currentPrice: number, session: string, priority: string,
-  reason: string, status: string
+  reason: string, status: string,
+  setupId?: number
 ): string {
   const arrow = direction.includes("LONG") ? "🟢" : "🔴";
   const isEntering = status === "ENTERING";
   const action = isEntering ? "SETUP FORMING" : "ENTER NOW";
   const urgency = isEntering ? "⚠️" : "🚨";
   const sessionShort = session.split(" ")[0];
+  const displayId = setupId ? String(setupId % 100).padStart(2, '0') : "??";
 
-  return `<b>${urgency} ${arrow} XAU/USD — ${action}</b>
+  return `<b>${urgency} ${arrow} XAU/USD — ${action} (#${displayId})</b>
 <b>Direction:</b> ${arrow} ${direction} | ${sessionShort} (${priority})
 <b>Zone:</b> ${zoneLabel}
 <b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : "\nReply <b>CONFIRMED</b> to track"}`;
+<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : `\nReply <b>IN ${displayId}</b> to track`}`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -703,8 +705,9 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
     signalsToSave.push({ direction: zone.type, zoneKey: zone.key });
     markZoneCooldown(zone.key);
 
+    let setupId: number | undefined;
     try {
-      await db.insert(activeSetups).values({
+      const [insertedSetup] = await db.insert(activeSetups).values({
         zoneKey: zone.key,
         direction: zone.type,
         zoneLabel: zone.label,
@@ -719,7 +722,10 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
         status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
         session,
         priority,
-      });
+      }).returning({ id: activeSetups.id });
+      
+      setupId = insertedSetup?.id;
+
       await db.insert(signals).values({
         direction: zone.type,
         zoneLabel: zone.label,
@@ -741,7 +747,7 @@ export async function scanZones(priceData: { price: number; bid: number; ask: nu
       console.error("[Bot] DB insert error:", err);
     }
 
-    const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status);
+    const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status, setupId);
     await sendTelegram(msg, "signal");
   }
 
@@ -932,7 +938,7 @@ async function handleCloseAllCommand() {
   await sendTelegram(`<b>🔴 Manually closed ${openTrades.length} trade(s)</b>\nAll positions marked closed.`, "close_all");
 }
 
-async function handleConfirmedCommand(index: number | null) {
+async function handleConfirmedCommand(input: number | null) {
   const setups = await db.select().from(activeSetups).orderBy(desc(activeSetups.detectedAt));
 
   if (setups.length === 0) {
@@ -940,9 +946,26 @@ async function handleConfirmedCommand(index: number | null) {
     return;
   }
 
-  const setupToConfirm = index !== null ? setups[index] : setups[0];
+  let setupToConfirm;
+
+  if (input !== null) {
+    // Check if input matches the display ID (last 2 digits of DB ID)
+    setupToConfirm = setups.find(s => (s.id % 100) === input);
+    
+    // Fallback to array index if no ID match (for backward compatibility)
+    if (!setupToConfirm && input > 0 && input <= setups.length) {
+      setupToConfirm = setups[input - 1];
+    }
+  } else {
+    // Default to the most recent setup
+    setupToConfirm = setups[0];
+  }
+
   if (!setupToConfirm) {
-    await sendTelegram(`No setup at position ${(index ?? 0) + 1}.`, "confirmed");
+    const errorMsg = input !== null 
+      ? `No setup found with ID or position ${String(input).padStart(2, '0')}.`
+      : "No pending setups to confirm.";
+    await sendTelegram(errorMsg, "confirmed");
     return;
   }
 
