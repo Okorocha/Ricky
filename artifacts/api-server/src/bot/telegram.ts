@@ -535,16 +535,19 @@ export function formatSignal(
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
   const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
   const tpField = tpLevel.toLowerCase() as "tp1" | "tp2" | "tp3";
+  const target = trade[tpField];
   const action = tpLevel === "TP1" ? "Close half, SL to BE" : tpLevel === "TP3" ? "🏆 TRADE COMPLETE" : "Let it run";
   return `<b>✅ ${tpLevel} HIT — $${currentPrice.toFixed(2)}</b>
 ${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
-${tpLevel}: $${trade[tpField].toFixed(2)}
+Target ${tpLevel}: $${target.toFixed(2)}
 ${action}`;
 }
 
-export function formatSLHit(trade: { direction: string; entry: number }, currentPrice: number): string {
+export function formatSLHit(trade: { direction: string; entry: number; sl: number }, currentPrice: number): string {
+  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
   return `<b>❌ SL HIT — $${currentPrice.toFixed(2)}</b>
-🔴 ${trade.direction} @ $${trade.entry.toFixed(2)}
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+Stop Loss: $${trade.sl.toFixed(2)}
 Wait for next A+ setup. Do NOT revenge trade.`;
 }
 
@@ -790,6 +793,14 @@ export async function trackActiveTrades(price: number) {
 
     for (const trade of trades) {
       const isLong = trade.direction.includes("LONG");
+
+      // Validate price alignment to prevent false exits
+      // If price is > 100 pips away from entry in the WRONG direction, ignore as data glitch
+      const distFromEntry = isLong ? trade.entry - price : price - trade.entry;
+      if (distFromEntry > 100) {
+        console.warn(`[Bot] Ignoring price tick $${price} for ${trade.direction} trade at $${trade.entry} (extreme outlier)`);
+        continue;
+      }
 
       if (!trade.tp1Hit) {
         const tp1Reached = isLong ? price >= trade.tp1 : price <= trade.tp1;
