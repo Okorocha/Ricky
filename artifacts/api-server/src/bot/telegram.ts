@@ -114,13 +114,6 @@ export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
 // ── Dynamic Level Computation ────────────────────────────────────────────────
 // Fallback static levels used until the first successful refresh
 let LEVELS: Record<string, { price: number; label: string; tier: string }> = {
-  pp:  { price: 4060.00, label: "Daily Pivot",          tier: "major" },
-  r1:  { price: 4080.00, label: "Daily R1",             tier: "key"   },
-  r2:  { price: 4110.00, label: "Daily R2",             tier: "major" },
-  r3:  { price: 4130.00, label: "Daily R3",             tier: "key"   },
-  s1:  { price: 4040.00, label: "Daily S1",             tier: "key"   },
-  s2:  { price: 4010.00, label: "Daily S2",             tier: "major" },
-  s3:  { price: 3990.00, label: "Daily S3",             tier: "key"   },
   sh1: { price: 4120.00, label: "Swing High 1",         tier: "major" },
   sl1: { price: 4000.00, label: "Swing Low 1",          tier: "major" },
 };
@@ -143,27 +136,10 @@ async function refreshDynamicLevels(): Promise<void> {
       return;
     }
 
-    // Use previous completed day (second-to-last; last candle may be in-progress)
+    // Use previous completed day for baseline
     const prev = daily[daily.length - 2]!;
-    const PP = (prev.high + prev.low + prev.close) / 3;
-    const R1 = 2 * PP - prev.low;
-    const R2 = PP + (prev.high - prev.low);
-    const R3 = prev.high + 2 * (PP - prev.low);
-    const S1 = 2 * PP - prev.high;
-    const S2 = PP - (prev.high - prev.low);
-    const S3 = prev.low - 2 * (prev.high - PP);
-
     const round2 = (n: number) => Math.round(n * 100) / 100;
-
-    const newLevels: Record<string, { price: number; label: string; tier: string }> = {
-      pp: { price: round2(PP), label: "Daily Pivot",  tier: "major" },
-      r1: { price: round2(R1), label: "Daily R1",     tier: "key"   },
-      r2: { price: round2(R2), label: "Daily R2",     tier: "major" },
-      r3: { price: round2(R3), label: "Daily R3",     tier: "key"   },
-      s1: { price: round2(S1), label: "Daily S1",     tier: "key"   },
-      s2: { price: round2(S2), label: "Daily S2",     tier: "major" },
-      s3: { price: round2(S3), label: "Daily S3",     tier: "key"   },
-    };
+    const newLevels: Record<string, { price: number; label: string; tier: string }> = {};
 
     // Detect swing highs/lows from 1h data (3-bar pivot rule)
     if (hourly.length >= 7) {
@@ -206,7 +182,7 @@ async function refreshDynamicLevels(): Promise<void> {
     // Psychological $50 round numbers within $200 of current price
     const currentPrice = priceHistory.length > 0
       ? priceHistory[priceHistory.length - 1]!.price
-      : PP;
+      : prev.close;
     const roundStep = 50;
     const base = Math.floor(currentPrice / roundStep) * roundStep;
     for (let i = -4; i <= 4; i++) {
@@ -223,7 +199,7 @@ async function refreshDynamicLevels(): Promise<void> {
 
     LEVELS = newLevels;
     levelsRefreshedAt = Date.now();
-    console.log(`[Bot] Dynamic levels refreshed — ${Object.keys(newLevels).length} zones | PP: $${PP.toFixed(2)} | Prev day H/L: $${prev.high.toFixed(2)}/$${prev.low.toFixed(2)}`);
+    console.log(`[Bot] Dynamic levels refreshed — ${Object.keys(newLevels).length} zones | Prev day H/L: $${prev.high.toFixed(2)}/$${prev.low.toFixed(2)}`);
   } catch (err) {
     console.error("[Bot] Failed to refresh dynamic levels:", err);
   }
