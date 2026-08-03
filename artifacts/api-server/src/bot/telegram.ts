@@ -4,7 +4,7 @@ import { eq, and, desc, gte } from "drizzle-orm";
 
 const TOKEN = process.env.TELEGRAM_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const POLL_INTERVAL = 30000; // 30 seconds
+const POLL_INTERVAL = 3000; // 3 seconds for faster response
 
 // ── Scan result ───────────────────────────────────────────────────────────────
 export interface ScanResult {
@@ -1005,11 +1005,11 @@ I will alert you when TP/SL is hit.`;
 
 // ── Auto-Scan Loop (15-minute interval) ────────────────────────────────────
 let autoScanInterval: ReturnType<typeof setInterval> | null = null;
-const AUTO_SCAN_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const AUTO_SCAN_INTERVAL_MS = 30 * 1000; // 30 seconds for faster signal detection
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting auto-scan loop (15-minute interval)");
+  console.log("[Bot] Starting auto-scan loop (30-second interval)");
 
   // Run an immediate scan on startup
   (async () => {
