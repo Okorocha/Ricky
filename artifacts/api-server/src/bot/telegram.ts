@@ -98,6 +98,22 @@ let thirtyMinCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = 
 const THIRTY_MIN_CACHE_TTL = 2 * 60 * 1000;
 
 let fourHourCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+let oneHourCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const ONE_HOUR_CACHE_TTL = 4 * 60 * 60 * 1000;
+
+export async function getRecent1HourCandles(): Promise<OHLCCandle[]> {
+  const now = Date.now();
+  if (oneHourCandleCache && now - oneHourCandleCache.fetchedAt < ONE_HOUR_CACHE_TTL) {
+    return oneHourCandleCache.candles;
+  }
+  try {
+    const candles = await fetchTwelveDataOHLC("1h", 48);
+    oneHourCandleCache = { candles, fetchedAt: now };
+    return candles;
+  } catch {
+    return oneHourCandleCache?.candles ?? [];
+  }
+}
 const FOUR_HOUR_CACHE_TTL = 4 * 60 * 60 * 1000;
 
 export async function getRecent30MinCandles(): Promise<OHLCCandle[]> {
@@ -380,6 +396,37 @@ function analyze30MStructure(candles: OHLCCandle[]): Structure30M {
   return { trend: "neutral", lastSwingHigh: swingHigh > -Infinity ? swingHigh : 0, lastSwingLow: swingLow < Infinity ? swingLow : 0 };
 }
 
+// ─── 1H Structure Analysis (for confluence filter) ─────────────────────────
+function analyze1HStructure(candles: OHLCCandle[]): { trend: "bullish" | "bearish" | "neutral"; lastSwingHigh: number; lastSwingLow: number } {
+  if (candles.length < 8) return { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0 };
+  const recent = candles.slice(-8);
+  const lookback = 2;
+  let swingHigh = -Infinity;
+  let swingLow = Infinity;
+  for (let i = lookback; i < recent.length - lookback; i++) {
+    const c = recent[i]!;
+    const left = recent.slice(i - lookback, i);
+    const right = recent.slice(i + 1, i + lookback + 1);
+    if (left.every(x => x.high <= c.high) && right.every(x => x.high <= c.high)) swingHigh = Math.max(swingHigh, c.high);
+    if (left.every(x => x.low >= c.low) && right.every(x => x.low >= c.low)) swingLow = Math.min(swingLow, c.low);
+  }
+  if (swingHigh > -Infinity || swingLow < Infinity) {
+    const lastCandle = recent[recent.length - 1]!;
+    const prevCandle = recent[recent.length - 2]!;
+    if (lastCandle.close > prevCandle.close && lastCandle.close > swingLow + 2) return { trend: "bullish", lastSwingHigh: swingHigh, lastSwingLow: swingLow };
+    if (lastCandle.close < prevCandle.close && lastCandle.close < swingHigh - 2) return { trend: "bearish", lastSwingHigh: swingHigh, lastSwingLow: swingLow };
+  }
+  // Fallback: EMA on 1H
+  if (candles.length >= 12) {
+    const closes = candles.slice(-12).map(c => c.close);
+    const ema12 = closes.reduce((s, v) => s + v, 0) / closes.length;
+    const lastClose = closes[closes.length - 1]!;
+    if (lastClose > ema12 * 1.001) return { trend: "bullish", lastSwingHigh: lastClose + 5, lastSwingLow: lastClose - 10 };
+    if (lastClose < ema12 * 0.999) return { trend: "bearish", lastSwingHigh: lastClose + 10, lastSwingLow: lastClose - 5 };
+  }
+  return { trend: "neutral", lastSwingHigh: swingHigh > -Infinity ? swingHigh : 0, lastSwingLow: swingLow < Infinity ? swingLow : 0 };
+}
+
 // ─── 30M Range Detection ─────────────────────────────────────────────────────
 interface RangeResult {
   isRanging: boolean;
@@ -504,7 +551,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>30M Bias Only | CHoCH/Sweep Required</b>`;
+<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum Only</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -655,9 +702,8 @@ export async function scanSMCZones(
   const structure30m = analyze30MStructure(candles30m);
 
   // ─── STEP 3: Bias from 30M only ───
-  // No 4H check — 30M structure is the sole bias source
   const structure4h: MarketStructure = { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy", swingPoints: [], isRanging: false, rangeWidth: 0 };
-  let biasSource: "30M" = "30M";
+  let biasSource: "30M+1H" = "30M+1H";
   let activeBias: "bullish" | "bearish";
   let biasLabel: string;
 
@@ -669,6 +715,13 @@ export async function scanSMCZones(
     return { setupFound: false, count: 0, reason: "30M neutral — no clear swing structure" };
   }
 
+  // ─── STEP 3.5: 1H Confluence Filter (NEW) ───
+  const candles1h = await getRecent1HourCandles();
+  if (candles1h.length < 8) return { setupFound: false, count: 0, reason: "1H candles insufficient for confluence" };
+  const structure1h = analyze1HStructure(candles1h);
+  if (structure1h.trend === "neutral") return { setupFound: false, count: 0, reason: "1H neutral — no clear structure" };
+  if (structure1h.trend !== activeBias) return { setupFound: false, count: 0, reason: `1H/30M mismatch (1H: ${structure1h.trend}, 30M: ${activeBias})` };
+
   // ─── STEP 4: 30M Order Blocks filtered by active bias ───
   const orderBlocks = detectOrderBlocks(candles30m);
   const validOBs = orderBlocks.filter(ob =>
@@ -679,24 +732,17 @@ export async function scanSMCZones(
   if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // ─── STEP 5: CHoCH + Sweep (required for confirmation) ───
+  // ─── STEP 5: CHoCH + Momentum Only (Tight Confirmation) ───
   const choch = detectCHoCH(candles30m);
-
-  // Use 30M swing levels for sweep detection (no 4H)
   const range30m = detect30MRange(candles30m);
-  let swingHigh = range30m.isRanging ? range30m.rangeTop : structure30m.lastSwingHigh;
-  let swingLow = range30m.isRanging ? range30m.rangeBottom : structure30m.lastSwingLow;
-  const sweep = detectLiquiditySweep(candles30m, swingHigh, swingLow);
 
-  // ─── Multi-Mode Confirmation (A/B/C tiers) ───
-  const hasConfirmation = choch.occurred || sweep !== "none";
+  // ─── Tight Confirmation: CHoCH (A) or Momentum (B) only ───
   let confMode = "none";
-  let confQuality: "A" | "B" | "C" = "C";
+  let confQuality: "A" | "B" = "B";
 
   if (choch.occurred) { confMode = "CHoCH"; confQuality = "A"; }
-  else if (sweep !== "none") { confMode = "sweep"; confQuality = "A"; }
   else {
-    // B-tier: Momentum confirmation — 3 consecutive directional moves with a big candle
+    // B-tier: Momentum — 3 consecutive directional moves with a big candle
     if (priceHistory.length >= 3) {
       const recent = priceHistory.slice(-3);
       const moves = [recent[1]!.price - recent[0]!.price, recent[2]!.price - recent[1]!.price];
@@ -705,18 +751,10 @@ export async function scanSMCZones(
       const hasBig = moves.some(m => Math.abs(m) > 4);
       if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
     }
-    // C-tier: Retest alignment — 3 of last 4 moves in trend direction
-    if (confMode === "none" && priceHistory.length >= 4) {
-      const recent = priceHistory.slice(-4);
-      const moves = [recent[1]!.price - recent[0]!.price, recent[2]!.price - recent[1]!.price, recent[3]!.price - recent[2]!.price];
-      const isBullishBias = activeBias === "bullish";
-      const alignedCount = isBullishBias ? moves.filter(m => m > 0).length : moves.filter(m => m < 0).length;
-      if (alignedCount >= 3) { confMode = "retest"; confQuality = "C"; }
-    }
   }
 
   if (confMode === "none") {
-    return { setupFound: false, count: 0, reason: `No confirmation on 30M (modes tried: momentum, retest)` };
+    return { setupFound: false, count: 0, reason: `No confirmation (CHoCH + Momentum only)` };
   }
 
   // ─── STEP 6: Evaluate each valid OB ───
@@ -726,9 +764,9 @@ export async function scanSMCZones(
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     const entryPrice = ob.price;
-    // Quality-based distance: C-tier requires tighter OB (5–20), A/B-tier allows wider (1–30)
-    const minDist = confQuality === "C" ? 5 : 1;
-    const maxDist = confQuality === "C" ? 20 : 30;
+    // Quality-based distance: Momentum (B) requires tighter OB (5–20), CHoCH (A) allows wider (2–30)
+    const minDist = confQuality === "B" ? 5 : 2;
+    const maxDist = confQuality === "B" ? 20 : 30;
     if (ob.distance > maxDist || ob.distance < minDist) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
@@ -759,7 +797,7 @@ export async function scanSMCZones(
     const obType = ob.direction === "LONG" ? "Bullish" : "Bearish";
     const msg = formatSMCSignal(
       ob.direction, entryPrice, sl, slDistance, tp1, tp2, tp3,
-      price, activeBias, obType, choch.occurred, sweep, session, priority, biasSource
+      price, activeBias, obType, choch.occurred, "none", session, priority, biasSource
     );
 
     try {
@@ -769,7 +807,7 @@ export async function scanSMCZones(
         zoneTier: "major", entry: entryPrice, sl, slDistance,
         tp1, tp2, tp3, currentPrice: price, session,
         priority: "A+",
-        reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | CHoCH: ${choch.occurred} | Sweep: ${sweep}`,
+        reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | CHoCH: ${choch.occurred} | 1H Confluence: ${structure1h.trend}`,
         status: "AT_LEVEL", zoneKey,
       });
       await db.insert(activeSetups).values({
@@ -928,7 +966,7 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: 30M Bias Only | CHoCH/Sweep Required
+Mode: Tight | 30M+1H Confluence | CHoCH/Momentum Only
 Scan: Every 3 min`, "alive"
         );
         continue;
@@ -952,7 +990,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M Bias Only`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | 30M+1H Confluence`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1016,7 +1054,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — Multi-Mode Confirmation (CHoCH/Sweep/Momentum/Retest)");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH+Momentum, 1H Confluence)");
   (async () => {
     try {
       const priceData = await fetchGoldData();
