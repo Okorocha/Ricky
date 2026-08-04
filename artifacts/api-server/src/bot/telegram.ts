@@ -554,7 +554,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum | Spread-Aware SL</b>`;
+<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum | Structural SL</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -685,10 +685,8 @@ export async function scanSMCZones(
   const { session, priority } = getSessionInfo();
   if (priority === "LOW") return { setupFound: false, count: 0, reason: `Outside active hours — ${session}` };
 
-  // Gate 3: Spread — Standard account: block only during extreme spikes (news/rollover)
-  // Swissquote feed: spread is in absolute dollars (e.g., 0.50 = 50 pips on gold)
-  // SL has 5pt buffer built in, so 35-pip sessions are safe — only block >50 pips
-  if (spread > 0.50) return { setupFound: false, count: 0, reason: `Spread too wide (${(spread * 100).toFixed(0)} pips)` };
+  // Gate 3: Spread — removed. SL is placed structurally below/above OB with buffer.
+  // Spread wicks are absorbed by the structural SL placement, not by filtering setups.
 
   // Gate 4: Global cooldown
   const timeSinceLast = Date.now() - lastGlobalSignalTime;
@@ -972,7 +970,7 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: Tight | Spread-Aware | 30M+1H | CHoCH/Momentum Only
+Mode: Tight | Structural SL | 30M+1H | CHoCH/Momentum Only
 Scan: Every 3 min`, "alive"
         );
         continue;
@@ -996,7 +994,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Spread-Aware | 30M+1H`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Structural SL | 30M+1H`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1060,7 +1058,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight+Spread Mode (CHoCH+Momentum, 1H Confluence, Spread-Aware SL)");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH+Momentum, 1H Confluence, Structural SL)");
   (async () => {
     try {
       const priceData = await fetchGoldData();
