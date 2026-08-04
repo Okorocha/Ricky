@@ -497,8 +497,11 @@ function calculateSMCSL(
   }
 
   const slDist = Math.abs(entry - structureSL);
-  // Day trading SL: minimum $25, maximum $45
-  const finalDist = Math.max(20, Math.min(slDist, 40));
+  // Standard account spread-aware SL: add 5pt buffer to absorb 20-35 pip spread wicks
+  // Min 30pts ensures SL isn't eaten by spread alone, max 50pts keeps R:R viable
+  const spreadBuffer = 5.0;
+  const baseDist = Math.max(25, Math.min(slDist, 45)) + spreadBuffer;
+  const finalDist = Math.max(30, Math.min(baseDist, 50));
   const finalSL = isLong ? entry - finalDist : entry + finalDist;
 
   return { sl: Math.round(finalSL * 100) / 100, slDistance: Math.round(finalDist * 100) / 100 };
@@ -551,7 +554,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum Only</b>`;
+<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum | Spread-Aware SL</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -682,8 +685,10 @@ export async function scanSMCZones(
   const { session, priority } = getSessionInfo();
   if (priority === "LOW") return { setupFound: false, count: 0, reason: `Outside active hours — ${session}` };
 
-  // Gate 3: Spread
-  if (spread > 3.0) return { setupFound: false, count: 0, reason: `Spread too wide (${spread.toFixed(2)})` };
+  // Gate 3: Spread — Standard account needs tight spread to avoid SL sweeps
+  // Swissquote feed: spread is in absolute dollars (e.g., 0.30 = 30 pips on gold)
+  // Block if spread > 0.30 (30 pips) — during news/rollover spread can spike to 50-120
+  if (spread > 0.30) return { setupFound: false, count: 0, reason: `Spread too wide (${(spread * 100).toFixed(0)} pips)` };
 
   // Gate 4: Global cooldown
   const timeSinceLast = Date.now() - lastGlobalSignalTime;
@@ -774,8 +779,9 @@ export async function scanSMCZones(
     const slBreached = isLong ? price <= sl : price >= sl;
     if (slBreached) continue;
 
+    // Spread-aware proximity: require more distance from SL to account for spread wicks
     const proximityToSL = isLong ? (price - sl) : (sl - price);
-    if (proximityToSL < (slDistance * 0.15)) continue;
+    if (proximityToSL < (slDistance * 0.25)) continue;
 
     if (blockedDirections.has(ob.direction)) continue;
 
@@ -966,7 +972,7 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: Tight | 30M+1H Confluence | CHoCH/Momentum Only
+Mode: Tight | Spread-Aware | 30M+1H | CHoCH/Momentum Only
 Scan: Every 3 min`, "alive"
         );
         continue;
@@ -990,7 +996,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | 30M+1H Confluence`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Spread-Aware | 30M+1H`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1054,7 +1060,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH+Momentum, 1H Confluence)");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight+Spread Mode (CHoCH+Momentum, 1H Confluence, Spread-Aware SL)");
   (async () => {
     try {
       const priceData = await fetchGoldData();
