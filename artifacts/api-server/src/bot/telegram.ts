@@ -139,11 +139,13 @@ interface MarketStructure {
   lastSwingLow: number;
   structure: "HH-HL" | "LH-LL" | "choppy";
   swingPoints: { price: number; type: "high" | "low"; index: number }[];
+  isRanging: boolean;
+  rangeWidth: number;
 }
 
 function analyze4HStructure(candles: OHLCCandle[]): MarketStructure {
   if (candles.length < 12) {
-    return { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy", swingPoints: [] };
+    return { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy", swingPoints: [], isRanging: false, rangeWidth: 0 };
   }
 
   const lookback = 3;
@@ -185,12 +187,38 @@ function analyze4HStructure(candles: OHLCCandle[]): MarketStructure {
     else if (lowerHighs && lowerLows) { structure = "LH-LL"; trend = "bearish"; }
   }
 
+  // ── Range detection: if highs and lows are roughly flat → 4H is ranging ──
+  let isRanging = false;
+  let rangeWidth = 0;
+
+  if (trend === "neutral" && highs.length >= 2 && lows.length >= 2) {
+    const maxHigh = Math.max(...highs);
+    const minLow = Math.min(...lows);
+    const midPrice = (maxHigh + minLow) / 2;
+    rangeWidth = maxHigh - minLow;
+
+    // A 4H range is defined as:
+    // - Highs within ~1% of each other (no clear HH or LH)
+    // - Lows within ~1% of each other (no clear HL or LL)
+    // - Range width is at least $15 (meaningful range, not flatline)
+    const highVariance = Math.abs(highs[0]! - highs[highs.length - 1]!) / midPrice;
+    const lowVariance = Math.abs(lows[0]! - lows[lows.length - 1]!) / midPrice;
+    const isFlat = highVariance < 0.01 && lowVariance < 0.01;
+    const hasWidth = rangeWidth >= 15;
+
+    if (isFlat && hasWidth) {
+      isRanging = true;
+    }
+  }
+
   return {
     trend,
     lastSwingHigh: highs.length > 0 ? highs[highs.length - 1]! : 0,
     lastSwingLow: lows.length > 0 ? lows[lows.length - 1]! : 0,
     structure,
     swingPoints,
+    isRanging,
+    rangeWidth,
   };
 }
 
@@ -339,6 +367,43 @@ function analyze30MStructure(candles: OHLCCandle[]): Structure30M {
   return { trend: "neutral", lastSwingHigh: swingHigh > -Infinity ? swingHigh : 0, lastSwingLow: swingLow < Infinity ? swingLow : 0 };
 }
 
+// ─── 30M Range Detection ─────────────────────────────────────────────────────
+interface RangeResult {
+  isRanging: boolean;
+  rangeTop: number;
+  rangeBottom: number;
+  rangeWidth: number;
+}
+
+function detect30MRange(candles: OHLCCandle[]): RangeResult {
+  if (candles.length < 12) return { isRanging: false, rangeTop: 0, rangeBottom: 0, rangeWidth: 0 };
+
+  const recent = candles.slice(-12);
+  const allHighs = recent.map(c => c.high);
+  const allLows = recent.map(c => c.low);
+  const rangeTop = Math.max(...allHighs);
+  const rangeBottom = Math.min(...allLows);
+  const rangeWidth = rangeTop - rangeBottom;
+
+  // 30M is ranging if price has been oscillating within a defined band
+  // and the range width is meaningful ($5+) but not too wide ($40+)
+  const recent3 = recent.slice(-3);
+  const avgClose = recent3.reduce((s, c) => s + c.close, 0) / recent3.length;
+  const midRange = (rangeTop + rangeBottom) / 2;
+
+  // If average close of last 3 candles is near the middle of the range,
+  // and the range is bounded (not trending through it), it's a range
+  const isCentered = Math.abs(avgClose - midRange) < rangeWidth * 0.3;
+  const isBounded = rangeWidth >= 5 && rangeWidth <= 40;
+
+  return {
+    isRanging: isCentered && isBounded,
+    rangeTop,
+    rangeBottom,
+    rangeWidth,
+  };
+}
+
 // ─── Liquidity Sweep Detection ───────────────────────────────────────────────
 function detectLiquiditySweep(candles: OHLCCandle[], swingHigh: number, swingLow: number): "above" | "below" | "none" {
   if (candles.length < 3) return "none";
@@ -404,13 +469,16 @@ export function formatSMCSignal(
   direction: string, entry: number, sl: number, slDist: number,
   tp1: number, tp2: number, tp3: number, currentPrice: number,
   trend: string, obType: string, choch: boolean, sweep: string,
-  session: string, priority: string
+  session: string, priority: string, biasSource: string = "4H"
 ): string {
   const isLong = direction.includes("LONG");
   const arrow = isLong ? "🟢" : "🔴";
   const action = isLong ? "BUY" : "SELL";
   const chochText = choch ? " ✅ CHoCH" : "";
   const sweepText = sweep !== "none" ? ` | Sweep: ${sweep}` : "";
+  const biasLabel = biasSource === "30M"
+    ? `${trend.toUpperCase()} (30M Immediate Bias · 4H Ranging)`
+    : `${trend.toUpperCase()} (4H Structure)`;
 
   return `<b>📊 SMC DAY TRADE — XAU/USD</b>
 ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
@@ -420,12 +488,12 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>TP2:</b> $${tp2.toFixed(2)} (2.5R)
 <b>TP3:</b> $${tp3.toFixed(2)} (4R)
 
-<b>Trend:</b> ${trend.toUpperCase()} (4H Structure)
+<b>Trend:</b> ${biasLabel}
 <b>Entry:</b> ${obType} Order Block
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Max 2 trades/day | Trend direction only</b>`;
+<b>Max 2 trades/day | ${biasSource === "30M" ? "30M Bias (4H Range)" : "Trend direction only"}</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -536,7 +604,7 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MAIN SMC SCAN
+// MAIN SMC SCAN — WITH MULTI-TIMEFRAME BIAS SWITCHING
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let lastSignaledSetupId: number | null = null;
@@ -569,26 +637,76 @@ export async function scanSMCZones(
   // Gate 5: Trade limits
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
 
-  // STEP 1: 4H Structure
-  const structure4h = analyze4HStructure(await getRecent4HourCandles());
-  if (structure4h.trend === "neutral") return { setupFound: false, count: 0, reason: "4H neutral — no clear trend" };
-
-  // STEP 2: 30M Order Blocks
+  // ─── STEP 1: Fetch both timeframes ───
+  const candles4h = await getRecent4HourCandles();
   const candles30m = await getRecent30MinCandles();
+
+  // ─── STEP 2: Analyze 4H structure ───
+  const structure4h = analyze4HStructure(candles4h);
+
+  // ─── STEP 3: Determine active bias based on multi-timeframe logic ───
+  // Bias resolution:
+  //   4H Trending (bullish/bearish) → use 4H bias
+  //   4H Ranging → check 30M structure
+  //     30M Trending → switch to 30M immediate bias
+  //     30M Also ranging → no trade (both timeframes flat)
+  //   4H Neutral (not ranging) → no trade (genuine indecision, no structure)
+
+  let biasSource: "4H" | "30M" = "4H";
+  let activeBias: "bullish" | "bearish";
+  let biasLabel: string;
+
+  if (structure4h.trend === "bullish" || structure4h.trend === "bearish") {
+    // 4H has a clear trend → use it as the primary bias
+    activeBias = structure4h.trend;
+    biasSource = "4H";
+    biasLabel = `${structure4h.trend}`;
+  } else if (structure4h.isRanging) {
+    // 4H is ranging → look at 30M for immediate bias
+    const structure30m = analyze30MStructure(candles30m);
+
+    if (structure30m.trend === "bullish" || structure30m.trend === "bearish") {
+      // 30M is trending → switch to 30M immediate bias
+      activeBias = structure30m.trend;
+      biasSource = "30M";
+      biasLabel = `${structure30m.trend} (30M) | 4H Range`;
+    } else {
+      // Both timeframes are flat → no trade
+      return { setupFound: false, count: 0, reason: "4H ranging + 30M neutral — no bias on either TF" };
+    }
+  } else {
+    // 4H is neutral but NOT in a defined range → genuine indecision, skip
+    return { setupFound: false, count: 0, reason: "4H neutral — no clear trend or range" };
+  }
+
+  // ─── STEP 4: 30M Order Blocks filtered by active bias ───
   const orderBlocks = detectOrderBlocks(candles30m);
   const validOBs = orderBlocks.filter(ob =>
-    (structure4h.trend === "bullish" && ob.direction === "LONG") ||
-    (structure4h.trend === "bearish" && ob.direction === "SHORT")
+    (activeBias === "bullish" && ob.direction === "LONG") ||
+    (activeBias === "bearish" && ob.direction === "SHORT")
   );
 
-  if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${structure4h.trend} direction` };
+  if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // STEP 3: 30M Structure + CHoCH + Sweep
+  // ─── STEP 5: 30M Structure + CHoCH + Sweep ───
   const structure30m = analyze30MStructure(candles30m);
   const choch = detectCHoCH(candles30m);
-  const sweep = detectLiquiditySweep(candles30m, structure4h.lastSwingHigh, structure4h.lastSwingLow);
 
+  // Use range boundaries for sweep detection when 4H is ranging,
+  // otherwise use 4H swing levels
+  let swingHigh = structure4h.lastSwingHigh;
+  let swingLow = structure4h.lastSwingLow;
+  if (biasSource === "30M") {
+    const range30m = detect30MRange(candles30m);
+    if (range30m.isRanging) {
+      swingHigh = range30m.rangeTop;
+      swingLow = range30m.rangeBottom;
+    }
+  }
+  const sweep = detectLiquiditySweep(candles30m, swingHigh, swingLow);
+
+  // ─── STEP 6: Evaluate each valid OB ───
   for (const ob of validOBs) {
     const zoneKey = `smc_${ob.direction.toLowerCase()}_${ob.index}`;
     if (blockedZoneKeys.has(zoneKey)) continue;
@@ -607,23 +725,39 @@ export async function scanSMCZones(
 
     if (blockedDirections.has(ob.direction)) continue;
 
-    const { tp1, tp2, tp3 } = calculateSMCTP(entryPrice, ob.direction, slDistance, structure4h);
+    // Calculate TPs — when bias is from 30M, use tighter TP targets
+    // because range-bound moves on 30M are typically shorter
+    let { tp1, tp2, tp3 } = calculateSMCTP(entryPrice, ob.direction, slDistance, structure4h);
+
+    // If 30M bias (4H ranging), cap TP3 at the 30M range boundary
+    if (biasSource === "30M") {
+      const range30m = detect30MRange(candles30m);
+      if (range30m.isRanging) {
+        if (isLong && tp3 > range30m.rangeTop) {
+          tp3 = Math.round(range30m.rangeTop * 100) / 100;
+        }
+        if (!isLong && tp3 < range30m.rangeBottom) {
+          tp3 = Math.round(range30m.rangeBottom * 100) / 100;
+        }
+      }
+    }
+
     markZoneCooldown(zoneKey);
 
     const obType = ob.direction === "LONG" ? "Bullish" : "Bearish";
     const msg = formatSMCSignal(
       ob.direction, entryPrice, sl, slDistance, tp1, tp2, tp3,
-      price, structure4h.trend, obType, choch.occurred, sweep, session, priority
+      price, activeBias, obType, choch.occurred, sweep, session, priority, biasSource
     );
 
     try {
       await db.insert(signals).values({
         direction: ob.direction,
-        zoneLabel: `${obType} OB (30M) | 4H ${structure4h.trend}`,
+        zoneLabel: `${obType} OB (30M) | ${biasSource} ${biasLabel}`,
         zoneTier: "major", entry: entryPrice, sl, slDistance,
         tp1, tp2, tp3, currentPrice: price, session,
         priority: "A+",
-        reason: `SMC: ${obType} OB + 4H ${structure4h.trend} | CHoCH: ${choch.occurred} | Sweep: ${sweep}`,
+        reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | CHoCH: ${choch.occurred} | Sweep: ${sweep}`,
         status: "AT_LEVEL", zoneKey,
       });
       await db.insert(activeSetups).values({
@@ -640,10 +774,14 @@ export async function scanSMCZones(
     await sendTelegram(msg, "smc_signal");
     lastGlobalSignalTime = Date.now();
 
-    return { setupFound: true, count: 1, reason: `SMC: ${obType} OB at $${entryPrice.toFixed(2)} | 4H ${structure4h.trend}` };
+    return {
+      setupFound: true,
+      count: 1,
+      reason: `SMC: ${obType} OB at $${entryPrice.toFixed(2)} | ${biasSource} ${biasLabel}`,
+    };
   }
 
-  return { setupFound: false, count: 0, reason: `No OBs in range | 4H: ${structure4h.trend}` };
+  return { setupFound: false, count: 0, reason: `No OBs in range | ${biasSource}: ${biasLabel}` };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -720,7 +858,7 @@ export async function expireStaleSetups(price: number) {
   } catch (err) { console.error("[Bot] expireStaleSetups error:", err); }
 }
 
-async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; blockedZoneKeys: Set<string>; todayTradeCount: number }> {
+async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; blockedZoneKeys: Set<string> }> {
   let openTrades: any[] = [];
   let pendingSetups: any[] = [];
   let allTodayTrades: any[] = [];
@@ -744,12 +882,14 @@ async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; 
   const blockedDirections = new Set<string>();
   for (const [dir, count] of directionCounts.entries()) { if (count >= 2) blockedDirections.add(dir); }
 
-  return { blockedDirections, blockedZoneKeys };
+  return { blockedDirections, blockedZoneKeys } as const;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TELEGRAM COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+let lastUpdateId = 0;
 
 export async function handleTelegramUpdates() {
   if (!TOKEN || !CHAT_ID) return;
@@ -773,10 +913,10 @@ export async function handleTelegramUpdates() {
         const status = openTrades.length > 0 ? `${openTrades.length} active trade(s)` : "No active trades";
         await sendTelegram(
           `<b>✅ Ricky Bot is ALIVE</b>
-SMC Day Trading Mode
+SMC Multi-TF Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: 4H Trend + 30M OB + CHoCH
+Mode: 4H Trend OR 30M Bias (when 4H ranges)
 Scan: Every 3 min | Max 2 trades/day`, "alive"
         );
         continue;
@@ -800,7 +940,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 4H+30M Day Trading`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 4H+30M Multi-TF`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -864,7 +1004,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — 4H Trend + 30M Order Blocks");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — 4H Trend + 30M OB + Multi-TF Bias");
   (async () => {
     try {
       const priceData = await fetchGoldData();
