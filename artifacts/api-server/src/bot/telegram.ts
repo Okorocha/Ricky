@@ -476,9 +476,7 @@ export function formatSMCSignal(
   const action = isLong ? "BUY" : "SELL";
   const chochText = choch ? " ✅ CHoCH" : "";
   const sweepText = sweep !== "none" ? ` | Sweep: ${sweep}` : "";
-  const biasLabel = biasSource === "30M"
-    ? `${trend.toUpperCase()} (30M Immediate Bias · 4H Ranging)`
-    : `${trend.toUpperCase()} (4H Structure)`;
+  const biasLabel = `${trend.toUpperCase()} (30M Bias)`;
 
   return `<b>📊 SMC DAY TRADE — XAU/USD</b>
 ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
@@ -493,7 +491,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Max 2 trades/day | ${biasSource === "30M" ? "30M Bias (4H Range)" : "Trend direction only"}</b>`;
+<b>30M Bias Only | CHoCH/Sweep Required</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -637,46 +635,25 @@ export async function scanSMCZones(
   // Gate 5: Trade limits
   const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
 
-  // ─── STEP 1: Fetch both timeframes ───
-  const candles4h = await getRecent4HourCandles();
+  // ─── STEP 1: Fetch 30M candles ───
   const candles30m = await getRecent30MinCandles();
 
-  // ─── STEP 2: Analyze 4H structure ───
-  const structure4h = analyze4HStructure(candles4h);
+  // ─── STEP 2: 30M Structure (bias only) ───
+  const structure30m = analyze30MStructure(candles30m);
 
-  // ─── STEP 3: Determine active bias based on multi-timeframe logic ───
-  // Bias resolution:
-  //   4H Trending (bullish/bearish) → use 4H bias
-  //   4H Ranging → check 30M structure
-  //     30M Trending → switch to 30M immediate bias
-  //     30M Also ranging → no trade (both timeframes flat)
-  //   4H Neutral (not ranging) → no trade (genuine indecision, no structure)
-
-  let biasSource: "4H" | "30M" = "4H";
+  // ─── STEP 3: Bias from 30M only ───
+  // No 4H check — 30M structure is the sole bias source
+  const structure4h: MarketStructure = { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy", swingPoints: [], isRanging: false, rangeWidth: 0 };
+  let biasSource: "30M" = "30M";
   let activeBias: "bullish" | "bearish";
   let biasLabel: string;
 
-  if (structure4h.trend === "bullish" || structure4h.trend === "bearish") {
-    // 4H has a clear trend → use it as the primary bias
-    activeBias = structure4h.trend;
-    biasSource = "4H";
-    biasLabel = `${structure4h.trend}`;
-  } else if (structure4h.isRanging) {
-    // 4H is ranging → look at 30M for immediate bias
-    const structure30m = analyze30MStructure(candles30m);
-
-    if (structure30m.trend === "bullish" || structure30m.trend === "bearish") {
-      // 30M is trending → switch to 30M immediate bias
-      activeBias = structure30m.trend;
-      biasSource = "30M";
-      biasLabel = `${structure30m.trend} (30M) | 4H Range`;
-    } else {
-      // Both timeframes are flat → no trade
-      return { setupFound: false, count: 0, reason: "4H ranging + 30M neutral — no bias on either TF" };
-    }
+  if (structure30m.trend === "bullish" || structure30m.trend === "bearish") {
+    activeBias = structure30m.trend;
+    biasLabel = `${structure30m.trend} (30M)`;
   } else {
-    // 4H is neutral but NOT in a defined range → genuine indecision, skip
-    return { setupFound: false, count: 0, reason: "4H neutral — no clear trend or range" };
+    // 30M neutral → no trade
+    return { setupFound: false, count: 0, reason: "30M neutral — no clear swing structure" };
   }
 
   // ─── STEP 4: 30M Order Blocks filtered by active bias ───
@@ -689,22 +666,20 @@ export async function scanSMCZones(
   if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // ─── STEP 5: 30M Structure + CHoCH + Sweep ───
-  const structure30m = analyze30MStructure(candles30m);
+  // ─── STEP 5: CHoCH + Sweep (required for confirmation) ───
   const choch = detectCHoCH(candles30m);
 
-  // Use range boundaries for sweep detection when 4H is ranging,
-  // otherwise use 4H swing levels
-  let swingHigh = structure4h.lastSwingHigh;
-  let swingLow = structure4h.lastSwingLow;
-  if (biasSource === "30M") {
-    const range30m = detect30MRange(candles30m);
-    if (range30m.isRanging) {
-      swingHigh = range30m.rangeTop;
-      swingLow = range30m.rangeBottom;
-    }
-  }
+  // Use 30M swing levels for sweep detection (no 4H)
+  const range30m = detect30MRange(candles30m);
+  let swingHigh = range30m.isRanging ? range30m.rangeTop : structure30m.lastSwingHigh;
+  let swingLow = range30m.isRanging ? range30m.rangeBottom : structure30m.lastSwingLow;
   const sweep = detectLiquiditySweep(candles30m, swingHigh, swingLow);
+
+  // ─── Require CHoCH OR sweep for confirmation ───
+  const hasConfirmation = choch.occurred || sweep !== "none";
+  if (!hasConfirmation) {
+    return { setupFound: false, count: 0, reason: "No CHoCH or sweep confirmation on 30M" };
+  }
 
   // ─── STEP 6: Evaluate each valid OB ───
   for (const ob of validOBs) {
@@ -725,20 +700,16 @@ export async function scanSMCZones(
 
     if (blockedDirections.has(ob.direction)) continue;
 
-    // Calculate TPs — when bias is from 30M, use tighter TP targets
-    // because range-bound moves on 30M are typically shorter
+    // Calculate TPs
     let { tp1, tp2, tp3 } = calculateSMCTP(entryPrice, ob.direction, slDistance, structure4h);
 
-    // If 30M bias (4H ranging), cap TP3 at the 30M range boundary
-    if (biasSource === "30M") {
-      const range30m = detect30MRange(candles30m);
-      if (range30m.isRanging) {
-        if (isLong && tp3 > range30m.rangeTop) {
-          tp3 = Math.round(range30m.rangeTop * 100) / 100;
-        }
-        if (!isLong && tp3 < range30m.rangeBottom) {
-          tp3 = Math.round(range30m.rangeBottom * 100) / 100;
-        }
+    // Cap TP3 at 30M range boundary if ranging
+    if (range30m.isRanging) {
+      if (isLong && tp3 > range30m.rangeTop) {
+        tp3 = Math.round(range30m.rangeTop * 100) / 100;
+      }
+      if (!isLong && tp3 < range30m.rangeBottom) {
+        tp3 = Math.round(range30m.rangeBottom * 100) / 100;
       }
     }
 
@@ -913,11 +884,11 @@ export async function handleTelegramUpdates() {
         const status = openTrades.length > 0 ? `${openTrades.length} active trade(s)` : "No active trades";
         await sendTelegram(
           `<b>✅ Ricky Bot is ALIVE</b>
-SMC Multi-TF Day Trading Mode
+SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: 4H Trend OR 30M Bias (when 4H ranges)
-Scan: Every 3 min | Max 2 trades/day`, "alive"
+Mode: 30M Bias Only | CHoCH/Sweep Required
+Scan: Every 3 min`, "alive"
         );
         continue;
       }
@@ -940,7 +911,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 4H+30M Multi-TF`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M Bias Only`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1004,7 +975,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — 4H Trend + 30M OB + Multi-TF Bias");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — 30M Bias Only + CHoCH/Sweep Required");
   (async () => {
     try {
       const priceData = await fetchGoldData();
