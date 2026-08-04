@@ -685,10 +685,10 @@ export async function scanSMCZones(
   const { session, priority } = getSessionInfo();
   if (priority === "LOW") return { setupFound: false, count: 0, reason: `Outside active hours — ${session}` };
 
-  // Gate 3: Spread — Standard account needs tight spread to avoid SL sweeps
-  // Swissquote feed: spread is in absolute dollars (e.g., 0.30 = 30 pips on gold)
-  // Block if spread > 0.30 (30 pips) — during news/rollover spread can spike to 50-120
-  if (spread > 0.30) return { setupFound: false, count: 0, reason: `Spread too wide (${(spread * 100).toFixed(0)} pips)` };
+  // Gate 3: Spread — Standard account: block only during extreme spikes (news/rollover)
+  // Swissquote feed: spread is in absolute dollars (e.g., 0.50 = 50 pips on gold)
+  // SL has 5pt buffer built in, so 35-pip sessions are safe — only block >50 pips
+  if (spread > 0.50) return { setupFound: false, count: 0, reason: `Spread too wide (${(spread * 100).toFixed(0)} pips)` };
 
   // Gate 4: Global cooldown
   const timeSinceLast = Date.now() - lastGlobalSignalTime;
