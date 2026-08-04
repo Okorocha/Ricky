@@ -567,8 +567,7 @@ export async function scanSMCZones(
   }
 
   // Gate 5: Trade limits
-  const { blockedDirections, blockedZoneKeys, todayTradeCount } = await getTradeConstraints();
-  if (todayTradeCount >= 2) return { setupFound: false, count: 0, reason: "Daily limit reached (2/2)" };
+  const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
 
   // STEP 1: 4H Structure
   const structure4h = analyze4HStructure(await getRecent4HourCandles());
@@ -745,7 +744,7 @@ async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; 
   const blockedDirections = new Set<string>();
   for (const [dir, count] of directionCounts.entries()) { if (count >= 2) blockedDirections.add(dir); }
 
-  return { blockedDirections, blockedZoneKeys, todayTradeCount: allTodayTrades.length };
+  return { blockedDirections, blockedZoneKeys };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
