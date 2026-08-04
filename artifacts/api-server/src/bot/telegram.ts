@@ -25,11 +25,11 @@ export interface ScanResult {
 
 // ── In-memory signal cooldown per zone ────────────────────────────────────────
 const zoneCooldowns = new Map<string, number>();
-const ZONE_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes for day trading
+const ZONE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes for day trading
 
 // ── Global signal cooldown ────────────────────────────────────────────────────
 let lastGlobalSignalTime = 0;
-const GLOBAL_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between signals
+const GLOBAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes between signals
 
 // ── DB-level cooldown check ───────────────────────────────────────────────────
 const breachNotifiedSetups = new Set<number>();
@@ -255,12 +255,12 @@ function detectOrderBlocks(candles: OHLCCandle[]): OrderBlock[] {
         const impulseStrength1 = next1.close - next1.open;
         const impulseStrength2 = next2.close - next2.open;
 
-        if (impulseStrength1 > 2.0 && next2.close > next1.close) {
+        if (impulseStrength1 > 1.5 && next2.close > next1.close) {
           const obLow = Math.min(ob.low, next1.low);
           const distance = currentPrice - obLow;
           const isMitigated = currentPrice < obLow;
 
-          if (!isMitigated && distance > 3 && distance < 60) {
+          if (!isMitigated && distance > 2 && distance < 80) {
             blocks.push({
               price: obLow, direction: "LONG", high: ob.high, low: obLow,
               bodyHigh: ob.open, bodyLow: ob.close, impulseTarget: next2.high,
@@ -280,12 +280,12 @@ function detectOrderBlocks(candles: OHLCCandle[]): OrderBlock[] {
         const impulseStrength1 = next1.open - next1.close;
         const impulseStrength2 = next2.open - next2.close;
 
-        if (impulseStrength1 > 2.0 && next2.close < next1.close) {
+        if (impulseStrength1 > 1.5 && next2.close < next1.close) {
           const obHigh = Math.max(ob.high, next1.high);
           const distance = obHigh - currentPrice;
           const isMitigated = currentPrice > obHigh;
 
-          if (!isMitigated && distance > 3 && distance < 60) {
+          if (!isMitigated && distance > 2 && distance < 80) {
             blocks.push({
               price: obHigh, direction: "SHORT", high: obHigh, low: ob.low,
               bodyHigh: ob.close, bodyLow: ob.open, impulseTarget: next2.low,
@@ -364,6 +364,19 @@ function analyze30MStructure(candles: OHLCCandle[]): Structure30M {
     if (lastCandle.close < prevCandle.close && lastCandle.close < swingHigh - 2) return { trend: "bearish", lastSwingHigh: swingHigh, lastSwingLow: swingLow };
   }
 
+  // Fallback: EMA-based bias when swing structure is inconclusive
+  if (candles.length >= 20) {
+    const closes = candles.slice(-20).map(c => c.close);
+    const ema20 = closes.reduce((s, v) => s + v, 0) / closes.length;
+    const lastClose = closes[closes.length - 1]!;
+    if (lastClose > ema20 * 1.001) {
+      return { trend: "bullish", lastSwingHigh: lastClose + 5, lastSwingLow: lastClose - 10 };
+    }
+    if (lastClose < ema20 * 0.999) {
+      return { trend: "bearish", lastSwingHigh: lastClose + 10, lastSwingLow: lastClose - 5 };
+    }
+  }
+
   return { trend: "neutral", lastSwingHigh: swingHigh > -Infinity ? swingHigh : 0, lastSwingLow: swingLow < Infinity ? swingLow : 0 };
 }
 
@@ -393,8 +406,8 @@ function detect30MRange(candles: OHLCCandle[]): RangeResult {
 
   // If average close of last 3 candles is near the middle of the range,
   // and the range is bounded (not trending through it), it's a range
-  const isCentered = Math.abs(avgClose - midRange) < rangeWidth * 0.3;
-  const isBounded = rangeWidth >= 5 && rangeWidth <= 40;
+  const isCentered = Math.abs(avgClose - midRange) < rangeWidth * 0.4;
+  const isBounded = rangeWidth >= 3 && rangeWidth <= 60;
 
   return {
     isRanging: isCentered && isBounded,
@@ -438,7 +451,7 @@ function calculateSMCSL(
 
   const slDist = Math.abs(entry - structureSL);
   // Day trading SL: minimum $25, maximum $45
-  const finalDist = Math.max(25, Math.min(slDist, 45));
+  const finalDist = Math.max(20, Math.min(slDist, 40));
   const finalSL = isLong ? entry - finalDist : entry + finalDist;
 
   return { sl: Math.round(finalSL * 100) / 100, slDistance: Math.round(finalDist * 100) / 100 };
@@ -528,7 +541,7 @@ Risk-free trade. Let it run to TP2/TP3.`;
 export function getSessionInfo(): { session: string; priority: string; note: string } {
   const now = new Date();
   const hour = now.getUTCHours();
-  if (hour >= 0 && hour < 7) return { session: "Asian Session", priority: "LOW", note: "Thin markets" };
+  if (hour >= 0 && hour < 7) return { session: "Asian Session", priority: "MEDIUM", note: "Counter-trend OK, smaller size" };
   if (hour >= 7 && hour < 12) return { session: "London Session", priority: "HIGH", note: "Strong momentum" };
   if (hour >= 12 && hour < 16) return { session: "London-NY Overlap", priority: "HIGHEST", note: "Peak volatility" };
   if (hour >= 16 && hour < 21) return { session: "NY Session", priority: "HIGH", note: "Momentum continuation" };
@@ -675,10 +688,35 @@ export async function scanSMCZones(
   let swingLow = range30m.isRanging ? range30m.rangeBottom : structure30m.lastSwingLow;
   const sweep = detectLiquiditySweep(candles30m, swingHigh, swingLow);
 
-  // ─── Require CHoCH OR sweep for confirmation ───
+  // ─── Multi-Mode Confirmation (A/B/C tiers) ───
   const hasConfirmation = choch.occurred || sweep !== "none";
-  if (!hasConfirmation) {
-    return { setupFound: false, count: 0, reason: "No CHoCH or sweep confirmation on 30M" };
+  let confMode = "none";
+  let confQuality: "A" | "B" | "C" = "C";
+
+  if (choch.occurred) { confMode = "CHoCH"; confQuality = "A"; }
+  else if (sweep !== "none") { confMode = "sweep"; confQuality = "A"; }
+  else {
+    // B-tier: Momentum confirmation — 3 consecutive directional moves with a big candle
+    if (priceHistory.length >= 3) {
+      const recent = priceHistory.slice(-3);
+      const moves = [recent[1]!.price - recent[0]!.price, recent[2]!.price - recent[1]!.price];
+      const isBullishBias = activeBias === "bullish";
+      const allDir = isBullishBias ? moves.every(m => m > 0) : moves.every(m => m < 0);
+      const hasBig = moves.some(m => Math.abs(m) > 4);
+      if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
+    }
+    // C-tier: Retest alignment — 3 of last 4 moves in trend direction
+    if (confMode === "none" && priceHistory.length >= 4) {
+      const recent = priceHistory.slice(-4);
+      const moves = [recent[1]!.price - recent[0]!.price, recent[2]!.price - recent[1]!.price, recent[3]!.price - recent[2]!.price];
+      const isBullishBias = activeBias === "bullish";
+      const alignedCount = isBullishBias ? moves.filter(m => m > 0).length : moves.filter(m => m < 0).length;
+      if (alignedCount >= 3) { confMode = "retest"; confQuality = "C"; }
+    }
+  }
+
+  if (confMode === "none") {
+    return { setupFound: false, count: 0, reason: `No confirmation on 30M (modes tried: momentum, retest)` };
   }
 
   // ─── STEP 6: Evaluate each valid OB ───
@@ -688,7 +726,10 @@ export async function scanSMCZones(
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     const entryPrice = ob.price;
-    if (ob.distance > 15 || ob.distance < 2) continue;
+    // Quality-based distance: C-tier requires tighter OB (5–20), A/B-tier allows wider (1–30)
+    const minDist = confQuality === "C" ? 5 : 1;
+    const maxDist = confQuality === "C" ? 20 : 30;
+    if (ob.distance > maxDist || ob.distance < minDist) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
     const isLong = ob.direction === "LONG";
@@ -696,7 +737,7 @@ export async function scanSMCZones(
     if (slBreached) continue;
 
     const proximityToSL = isLong ? (price - sl) : (sl - price);
-    if (proximityToSL < (slDistance * 0.2)) continue;
+    if (proximityToSL < (slDistance * 0.15)) continue;
 
     if (blockedDirections.has(ob.direction)) continue;
 
@@ -742,7 +783,7 @@ export async function scanSMCZones(
       console.error("[Bot] SMC signal insert error:", err);
     }
 
-    await sendTelegram(msg, "smc_signal");
+      await sendTelegram(msg, `smc_signal_${confMode}`);
     lastGlobalSignalTime = Date.now();
 
     return {
@@ -975,7 +1016,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — 30M Bias Only + CHoCH/Sweep Required");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — Multi-Mode Confirmation (CHoCH/Sweep/Momentum/Retest)");
   (async () => {
     try {
       const priceData = await fetchGoldData();
