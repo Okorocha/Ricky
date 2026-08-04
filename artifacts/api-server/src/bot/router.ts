@@ -2,7 +2,7 @@ import { router, publicProcedure } from "../trpc";
 import { db } from "@workspace/db";
 import { signals, activeSetups, activeTrades, telegramLog } from "@workspace/db";
 import { desc, eq, count } from "drizzle-orm";
-import { fetchGoldData, scanZones, sendTelegram } from "./telegram";
+import { fetchGoldData, scanSMCZones, sendTelegram } from "./telegram";
 
 export const botRouter = router({
   // Get current price
@@ -33,19 +33,25 @@ export const botRouter = router({
     return await db.select().from(activeSetups);
   }),
 
-  // Get telegram log (public — no auth required in this deployment)
+  // Get telegram log
   telegramLog: publicProcedure.query(async () => {
     return await db.select().from(telegramLog).orderBy(desc(telegramLog.sentAt)).limit(200);
   }),
 
   // Manual scan trigger
   triggerScan: publicProcedure.mutation(async () => {
-    const data = await fetchGoldData();
-    if (!data) {
-      return { ok: true, setupFound: false, count: 0, reason: "No price data available", message: "No price data available" };
+    try {
+      const data = await fetchGoldData();
+      if (!data) {
+        return { ok: true, setupFound: false, count: 0, reason: "No price data available", message: "No price data available" };
+      }
+      const result = await scanSMCZones(data);
+      return { ok: true, ...result, message: result.setupFound ? `${result.count} setup(s) found` : result.reason };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error("[Bot] triggerScan error:", err);
+      return { ok: false, setupFound: false, count: 0, reason: msg, message: `Scan error: ${msg}` };
     }
-    const result = await scanZones(data);
-    return { ok: true, ...result, message: result.setupFound ? `${result.count} setup(s) found` : result.reason };
   }),
 
   // Manual alive check

@@ -4,7 +4,17 @@ import { eq, and, desc, gte } from "drizzle-orm";
 
 const TOKEN = process.env.TELEGRAM_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const POLL_INTERVAL = 3000; // 3 seconds for faster response
+const POLL_INTERVAL = 30000; // 30 seconds
+const TWELVE_DATA_KEY = process.env.TWELVE_DATA_API_KEY || "";
+
+// ── Candle interface ──────────────────────────────────────────────────────────
+interface OHLCCandle {
+  time: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+}
 
 // ── Scan result ───────────────────────────────────────────────────────────────
 export interface ScanResult {
@@ -13,20 +23,43 @@ export interface ScanResult {
   reason: string;
 }
 
-// ── In-memory signal cooldown per zone (prevent duplicate signals) ────────────
+// ── In-memory signal cooldown per zone ────────────────────────────────────────
 const zoneCooldowns = new Map<string, number>();
-const ZONE_COOLDOWN_MS = 20 * 60 * 1000; // 20 minutes
+const ZONE_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes for day trading
+
+// ── Global signal cooldown ────────────────────────────────────────────────────
+let lastGlobalSignalTime = 0;
+const GLOBAL_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour between signals
+
+// ── DB-level cooldown check ───────────────────────────────────────────────────
+const breachNotifiedSetups = new Set<number>();
+const SETUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour for day trading setups
+
+async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
+  try {
+    const cutoff = new Date(Date.now() - ZONE_COOLDOWN_MS);
+    const recent = await db
+      .select({ id: signals.id })
+      .from(signals)
+      .where(and(eq(signals.zoneKey, zoneKey), gte(signals.createdAt, cutoff)))
+      .limit(1);
+    return recent.length > 0;
+  } catch {
+    return false;
+  }
+}
 
 function isZoneOnCooldown(zoneKey: string): boolean {
   const last = zoneCooldowns.get(zoneKey);
   if (!last) return false;
   return Date.now() - last < ZONE_COOLDOWN_MS;
 }
+
 function markZoneCooldown(zoneKey: string): void {
   zoneCooldowns.set(zoneKey, Date.now());
 }
 
-// ── Price history for multi-tick confirmation ─────────────────────────────────
+// ── Price history for momentum context ────────────────────────────────────────
 interface PriceTick {
   price: number;
   spread: number;
@@ -37,381 +70,420 @@ const PRICE_HISTORY_MAX = 20;
 
 function recordPriceTick(price: number, spread: number): void {
   priceHistory.push({ price, spread, ts: Date.now() });
-  if (priceHistory.length > PRICE_HISTORY_MAX) {
-    priceHistory.shift();
-  }
+  if (priceHistory.length > PRICE_HISTORY_MAX) priceHistory.shift();
 }
 
-function getPriceContext(): {
-  velocity: number;
-  spreadAvg: number;
-  consistent: boolean;
-  tickCount: number;
-} {
-  if (priceHistory.length < 2) {
-    return { velocity: 0, spreadAvg: priceHistory[0]?.spread ?? 0.5, consistent: false, tickCount: priceHistory.length };
-  }
-  const recent = priceHistory.slice(-Math.min(priceHistory.length, 8));
-  const deltas = recent.slice(1).map((t, i) => t.price - recent[i]!.price);
-  const velocity = deltas.reduce((a, b) => a + b, 0) / deltas.length;
-  const spreadAvg = recent.reduce((a, t) => a + t.spread, 0) / recent.length;
-  const positives = deltas.filter(d => d > 0).length;
-  const negatives = deltas.filter(d => d < 0).length;
-  const consistent = positives >= Math.ceil(deltas.length * 0.7) || negatives >= Math.ceil(deltas.length * 0.7);
-  return { velocity, spreadAvg, consistent, tickCount: recent.length };
+// ── Twelve Data OHLC Fetching ─────────────────────────────────────────────────
+async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promise<OHLCCandle[]> {
+  const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_DATA_KEY}`;
+  const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+  if (resp.status !== 200) throw new Error(`Twelve Data HTTP ${resp.status}`);
+  const j = await resp.json() as { status?: string; message?: string; values?: { datetime: string; open: string; high: string; low: string; close: string }[] };
+  if (j.status === "error") throw new Error(`Twelve Data: ${j.message}`);
+  const values = j.values || [];
+  return values
+    .reverse()
+    .map(v => ({
+      time: new Date(v.datetime.replace(" ", "T") + "Z").getTime(),
+      open: parseFloat(v.open),
+      high: parseFloat(v.high),
+      low: parseFloat(v.low),
+      close: parseFloat(v.close),
+    }))
+    .filter(c => c.high > 0);
 }
 
-// ── Yahoo Finance OHLC Fetching ──────────────────────────────────────────────
-interface OHLCCandle {
-  time: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
+// ── Candle caches ─────────────────────────────────────────────────────────────
+let thirtyMinCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const THIRTY_MIN_CACHE_TTL = 2 * 60 * 1000;
 
-async function fetchYahooOHLC(interval: string, range: string): Promise<OHLCCandle[]> {
-  // GC=F = Gold Futures (COMEX) — most reliable Yahoo Finance symbol for XAU/USD
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=${interval}&range=${range}`;
-  const resp = await fetch(url, {
-    headers: { "User-Agent": "Mozilla/5.0 (compatible; GoldBot/2.0)" },
-    signal: AbortSignal.timeout(6000),
-  });
-  if (resp.status !== 200) throw new Error(`Yahoo Finance HTTP ${resp.status}`);
-  const j = await resp.json() as any;
-  const result = j?.chart?.result?.[0];
-  if (!result) throw new Error("No chart result");
-  const timestamps: number[] = result.timestamp || [];
-  const quote = result.indicators?.quote?.[0] || {};
-  const candles: OHLCCandle[] = [];
-  for (let i = 0; i < timestamps.length; i++) {
-    const o = quote.open?.[i], h = quote.high?.[i], l = quote.low?.[i], c = quote.close?.[i];
-    if (o != null && h != null && l != null && c != null && h > 0) {
-      candles.push({ time: timestamps[i]! * 1000, open: o, high: h, low: l, close: c });
-    }
-  }
-  return candles;
-}
+let fourHourCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const FOUR_HOUR_CACHE_TTL = 4 * 60 * 60 * 1000;
 
-// ── 1-minute candle cache (for pattern detection) ─────────────────────────────
-let minuteCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
-const MINUTE_CACHE_TTL = 45_000; // 45 seconds
-
-export async function getRecentMinuteCandles(): Promise<OHLCCandle[]> {
+export async function getRecent30MinCandles(): Promise<OHLCCandle[]> {
   const now = Date.now();
-  if (minuteCandleCache && now - minuteCandleCache.fetchedAt < MINUTE_CACHE_TTL) {
-    return minuteCandleCache.candles;
+  if (thirtyMinCandleCache && now - thirtyMinCandleCache.fetchedAt < THIRTY_MIN_CACHE_TTL) {
+    return thirtyMinCandleCache.candles;
   }
   try {
-    const candles = await fetchYahooOHLC("1m", "1h");
-    minuteCandleCache = { candles, fetchedAt: now };
+    const candles = await fetchTwelveDataOHLC("30min", 96);
+    thirtyMinCandleCache = { candles, fetchedAt: now };
     return candles;
   } catch {
-    return minuteCandleCache?.candles ?? [];
+    return thirtyMinCandleCache?.candles ?? [];
   }
 }
 
-// ── Dynamic Level Computation ────────────────────────────────────────────────
-// Fallback static levels used until the first successful refresh
-let LEVELS: Record<string, { price: number; label: string; tier: string }> = {
-  sh1: { price: 4120.00, label: "Swing High 1",         tier: "major" },
-  sl1: { price: 4000.00, label: "Swing Low 1",          tier: "major" },
-};
-
-let levelsRefreshedAt = 0;
-const LEVELS_REFRESH_INTERVAL = 4 * 60 * 60 * 1000; // 4 hours
-
-async function refreshDynamicLevels(): Promise<void> {
+export async function getRecent4HourCandles(): Promise<OHLCCandle[]> {
+  const now = Date.now();
+  if (fourHourCandleCache && now - fourHourCandleCache.fetchedAt < FOUR_HOUR_CACHE_TTL) {
+    return fourHourCandleCache.candles;
+  }
   try {
-    const [dailyCandles, hourlyCandles] = await Promise.allSettled([
-      fetchYahooOHLC("1d", "5d"),
-      fetchYahooOHLC("1h", "5d"),
-    ]);
+    const candles = await fetchTwelveDataOHLC("4h", 48);
+    fourHourCandleCache = { candles, fetchedAt: now };
+    return candles;
+  } catch {
+    return fourHourCandleCache?.candles ?? [];
+  }
+}
 
-    const daily = dailyCandles.status === "fulfilled" ? dailyCandles.value : [];
-    const hourly = hourlyCandles.status === "fulfilled" ? hourlyCandles.value : [];
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMC MULTI-TIMEFRAME ENGINE
+// ═══════════════════════════════════════════════════════════════════════════════
 
-    if (daily.length < 2) {
-      console.warn("[Bot] Not enough daily data to compute pivots — keeping current levels");
-      return;
+// ─── 4H Market Structure (Swing Highs/Lows) ──────────────────────────────────
+interface MarketStructure {
+  trend: "bullish" | "bearish" | "neutral";
+  lastSwingHigh: number;
+  lastSwingLow: number;
+  structure: "HH-HL" | "LH-LL" | "choppy";
+  swingPoints: { price: number; type: "high" | "low"; index: number }[];
+}
+
+function analyze4HStructure(candles: OHLCCandle[]): MarketStructure {
+  if (candles.length < 12) {
+    return { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy", swingPoints: [] };
+  }
+
+  const lookback = 3;
+  const swingPoints: { price: number; type: "high" | "low"; index: number }[] = [];
+
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const c = candles[i]!;
+    const leftH = candles.slice(i - lookback, i);
+    const rightH = candles.slice(i + 1, i + lookback + 1);
+    const leftL = candles.slice(i - lookback, i);
+    const rightL = candles.slice(i + 1, i + lookback + 1);
+
+    if (leftH.every(x => x.high <= c.high) && rightH.every(x => x.high <= c.high)) {
+      swingPoints.push({ price: c.high, type: "high", index: i });
     }
+    if (leftL.every(x => x.low >= c.low) && rightL.every(x => x.low >= c.low)) {
+      swingPoints.push({ price: c.low, type: "low", index: i });
+    }
+  }
 
-    // Use previous completed day for baseline
-    const prev = daily[daily.length - 2]!;
-    const round2 = (n: number) => Math.round(n * 100) / 100;
-    const newLevels: Record<string, { price: number; label: string; tier: string }> = {};
+  swingPoints.sort((a, b) => a.index - b.index);
 
-    // Detect swing highs/lows from 1h data (3-bar pivot rule)
-    if (hourly.length >= 7) {
-      const lookback = 3;
-      const swingHighs: number[] = [];
-      const swingLows: number[]  = [];
+  const recentSwings = swingPoints.slice(-6);
+  const highs = recentSwings.filter(s => s.type === "high").map(s => s.price);
+  const lows = recentSwings.filter(s => s.type === "low").map(s => s.price);
 
-      for (let i = lookback; i < hourly.length - lookback; i++) {
-        const c = hourly[i]!;
-        const leftH  = hourly.slice(i - lookback, i);
-        const rightH = hourly.slice(i + 1, i + lookback + 1);
-        if (leftH.every(x => x.high <= c.high) && rightH.every(x => x.high <= c.high)) {
-          swingHighs.push(c.high);
-        }
-        if (leftH.every(x => x.low >= c.low) && rightH.every(x => x.low >= c.low)) {
-          swingLows.push(c.low);
+  let structure: "HH-HL" | "LH-LL" | "choppy" = "choppy";
+  let trend: "bullish" | "bearish" | "neutral" = "neutral";
+
+  if (highs.length >= 2 && lows.length >= 2) {
+    const lastTwoHighs = highs.slice(-2);
+    const lastTwoLows = lows.slice(-2);
+    const higherHighs = lastTwoHighs[1]! > lastTwoHighs[0]!;
+    const higherLows = lastTwoLows[1]! > lastTwoLows[0]!;
+    const lowerHighs = lastTwoHighs[1]! < lastTwoHighs[0]!;
+    const lowerLows = lastTwoLows[1]! < lastTwoLows[0]!;
+
+    if (higherHighs && higherLows) { structure = "HH-HL"; trend = "bullish"; }
+    else if (lowerHighs && lowerLows) { structure = "LH-LL"; trend = "bearish"; }
+  }
+
+  return {
+    trend,
+    lastSwingHigh: highs.length > 0 ? highs[highs.length - 1]! : 0,
+    lastSwingLow: lows.length > 0 ? lows[lows.length - 1]! : 0,
+    structure,
+    swingPoints,
+  };
+}
+
+// ─── 30M Order Block Detection ───────────────────────────────────────────────
+interface OrderBlock {
+  price: number;
+  direction: "LONG" | "SHORT";
+  high: number;
+  low: number;
+  bodyHigh: number;
+  bodyLow: number;
+  impulseTarget: number;
+  distance: number;
+  index: number;
+  isValid: boolean;
+}
+
+function detectOrderBlocks(candles: OHLCCandle[]): OrderBlock[] {
+  const blocks: OrderBlock[] = [];
+  if (candles.length < 4) return blocks;
+
+  const recent = candles.slice(-30);
+  const currentPrice = candles[candles.length - 1]?.close ?? 0;
+
+  for (let i = recent.length - 4; i >= 0; i--) {
+    const ob = recent[i]!;
+
+    // Bullish OB: last down candle before an impulse up
+    if (i + 2 < recent.length) {
+      const next1 = recent[i + 1]!;
+      const next2 = recent[i + 2]!;
+
+      if (ob.close < ob.open) {
+        const impulseStrength1 = next1.close - next1.open;
+        const impulseStrength2 = next2.close - next2.open;
+
+        if (impulseStrength1 > 2.0 && next2.close > next1.close) {
+          const obLow = Math.min(ob.low, next1.low);
+          const distance = currentPrice - obLow;
+          const isMitigated = currentPrice < obLow;
+
+          if (!isMitigated && distance > 3 && distance < 60) {
+            blocks.push({
+              price: obLow, direction: "LONG", high: ob.high, low: obLow,
+              bodyHigh: ob.open, bodyLow: ob.close, impulseTarget: next2.high,
+              distance, index: i, isValid: true,
+            });
+          }
         }
       }
-
-      // Most recent 3 swings, deduplicated within $2 of each other
-      const dedup = (arr: number[]): number[] =>
-        arr.filter((v, i, a) => !a.slice(0, i).some(u => Math.abs(u - v) < 2));
-
-      dedup(swingHighs).slice(-3).forEach((h, i) => {
-        newLevels[`sh${i + 1}`] = {
-          price: round2(h),
-          label: `Hourly Swing High ${i + 1}`,
-          tier: i === 0 ? "major" : "minor",
-        };
-      });
-      dedup(swingLows).slice(-3).forEach((l, i) => {
-        newLevels[`sl${i + 1}`] = {
-          price: round2(l),
-          label: `Hourly Swing Low ${i + 1}`,
-          tier: i === 0 ? "major" : "minor",
-        };
-      });
     }
 
-    // Psychological $50 round numbers within $200 of current price
-    const currentPrice = priceHistory.length > 0
-      ? priceHistory[priceHistory.length - 1]!.price
-      : prev.close;
-    const roundStep = 50;
-    const base = Math.floor(currentPrice / roundStep) * roundStep;
-    for (let i = -4; i <= 4; i++) {
-      const r = base + i * roundStep;
-      // Only add if no existing level is within $5
-      if (!Object.values(newLevels).some(v => Math.abs(v.price - r) < 5)) {
-        newLevels[`rnd${r}`] = {
-          price: r,
-          label: `Psychological $${r}`,
-          tier: "minor",
-        };
+    // Bearish OB: last up candle before an impulse down
+    if (i + 2 < recent.length) {
+      const next1 = recent[i + 1]!;
+      const next2 = recent[i + 2]!;
+
+      if (ob.close > ob.open) {
+        const impulseStrength1 = next1.open - next1.close;
+        const impulseStrength2 = next2.open - next2.close;
+
+        if (impulseStrength1 > 2.0 && next2.close < next1.close) {
+          const obHigh = Math.max(ob.high, next1.high);
+          const distance = obHigh - currentPrice;
+          const isMitigated = currentPrice > obHigh;
+
+          if (!isMitigated && distance > 3 && distance < 60) {
+            blocks.push({
+              price: obHigh, direction: "SHORT", high: obHigh, low: ob.low,
+              bodyHigh: ob.close, bodyLow: ob.open, impulseTarget: next2.low,
+              distance, index: i, isValid: true,
+            });
+          }
+        }
       }
     }
-
-    LEVELS = newLevels;
-    levelsRefreshedAt = Date.now();
-    console.log(`[Bot] Dynamic levels refreshed — ${Object.keys(newLevels).length} zones | Prev day H/L: $${prev.high.toFixed(2)}/$${prev.low.toFixed(2)}`);
-  } catch (err) {
-    console.error("[Bot] Failed to refresh dynamic levels:", err);
   }
+
+  return blocks;
 }
 
-export async function ensureLevelsRefreshed(): Promise<void> {
-  if (Date.now() - levelsRefreshedAt > LEVELS_REFRESH_INTERVAL) {
-    await refreshDynamicLevels();
+// ─── CHoCH Detection on 30M ──────────────────────────────────────────────────
+interface CHoCHResult {
+  occurred: boolean;
+  direction: "bullish" | "bearish";
+  swingLevel: number;
+  candlesAgo: number;
+}
+
+function detectCHoCH(candles: OHLCCandle[]): CHoCHResult {
+  if (candles.length < 8) return { occurred: false, direction: "bullish", swingLevel: 0, candlesAgo: 0 };
+
+  const recent = candles.slice(-8);
+  let swingHigh = -Infinity;
+  let swingLow = Infinity;
+  let swingHighIdx = -1;
+  let swingLowIdx = -1;
+
+  for (let i = 0; i < Math.min(6, recent.length - 2); i++) {
+    if (recent[i]!.high > swingHigh) { swingHigh = recent[i]!.high; swingHighIdx = i; }
+    if (recent[i]!.low < swingLow) { swingLow = recent[i]!.low; swingLowIdx = i; }
   }
-}
 
-function getZoneThreshold(tier: string): { entering: number; atLevel: number; sweep: number } {
-  switch (tier) {
-    case "major": return { entering: 10.0, atLevel: 3.0, sweep: 1.5 };
-    case "key":   return { entering: 8.0,  atLevel: 2.5, sweep: 1.2 };
-    default:      return { entering: 6.0,  atLevel: 2.0, sweep: 1.0 };
+  const lastCandle = recent[recent.length - 1]!;
+
+  if (lastCandle.close > swingHigh && swingHighIdx >= 0) {
+    return { occurred: true, direction: "bullish", swingLevel: swingHigh, candlesAgo: recent.length - 1 - swingHighIdx };
   }
-}
-
-function getHTFBias(price: number): "bullish" | "bearish" | "neutral" {
-  let above = 0, below = 0;
-  for (const [, info] of Object.entries(LEVELS)) {
-    if (info.tier === "minor") continue;
-    if (price > info.price) above++;
-    else below++;
+  if (lastCandle.close < swingLow && swingLowIdx >= 0) {
+    return { occurred: true, direction: "bearish", swingLevel: swingLow, candlesAgo: recent.length - 1 - swingLowIdx };
   }
-  const total = above + below;
-  if (total === 0) return "neutral";
-  const ratio = above / total;
-  if (ratio >= 0.65) return "bullish";
-  if (ratio <= 0.35) return "bearish";
-  return "neutral";
+
+  return { occurred: false, direction: "bullish", swingLevel: 0, candlesAgo: 0 };
 }
 
-// ── Candlestick / Price-action confirmation ──────────────────────────────────
-type CandlePattern = "pin_bar" | "engulfing" | "rejection" | "momentum" | "weak";
-
-interface CandleSignal {
-  pattern: CandlePattern;
-  strength: "strong" | "moderate" | "weak";
-  confirmed: boolean;
+// ─── 30M Structure ───────────────────────────────────────────────────────────
+interface Structure30M {
+  trend: "bullish" | "bearish" | "neutral";
+  lastSwingHigh: number;
+  lastSwingLow: number;
 }
 
-/** Detect patterns from real 1-min OHLC candles. Falls back to velocity when candles unavailable. */
-function detectCandleSignal(
-  price: number,
-  spread: number,
-  zoneDist: number,
-  zoneStatus: string,
+function analyze30MStructure(candles: OHLCCandle[]): Structure30M {
+  if (candles.length < 8) return { trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0 };
+
+  const recent = candles.slice(-8);
+  const lookback = 2;
+  let swingHigh = -Infinity;
+  let swingLow = Infinity;
+
+  for (let i = lookback; i < recent.length - lookback; i++) {
+    const c = recent[i]!;
+    const left = recent.slice(i - lookback, i);
+    const right = recent.slice(i + 1, i + lookback + 1);
+    if (left.every(x => x.high <= c.high) && right.every(x => x.high <= c.high)) swingHigh = Math.max(swingHigh, c.high);
+    if (left.every(x => x.low >= c.low) && right.every(x => x.low >= c.low)) swingLow = Math.min(swingLow, c.low);
+  }
+
+  if (swingHigh > -Infinity || swingLow < Infinity) {
+    const lastCandle = recent[recent.length - 1]!;
+    const prevCandle = recent[recent.length - 2]!;
+    if (lastCandle.close > prevCandle.close && lastCandle.close > swingLow + 2) return { trend: "bullish", lastSwingHigh: swingHigh, lastSwingLow: swingLow };
+    if (lastCandle.close < prevCandle.close && lastCandle.close < swingHigh - 2) return { trend: "bearish", lastSwingHigh: swingHigh, lastSwingLow: swingLow };
+  }
+
+  return { trend: "neutral", lastSwingHigh: swingHigh > -Infinity ? swingHigh : 0, lastSwingLow: swingLow < Infinity ? swingLow : 0 };
+}
+
+// ─── Liquidity Sweep Detection ───────────────────────────────────────────────
+function detectLiquiditySweep(candles: OHLCCandle[], swingHigh: number, swingLow: number): "above" | "below" | "none" {
+  if (candles.length < 3) return "none";
+  const last = candles[candles.length - 1]!;
+  if (last.high > swingHigh && last.close < swingHigh && swingHigh > 0) return "above";
+  if (last.low < swingLow && last.close > swingLow && swingLow > 0) return "below";
+  return "none";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SL / TP CALCULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function calculateSMCSL(
+  entry: number,
   direction: "LONG" | "SHORT",
-  candles: OHLCCandle[] = []
-): CandleSignal {
+  ob: OrderBlock,
+  structure30m: Structure30M
+): { sl: number; slDistance: number } {
   const isLong = direction === "LONG";
+  let structureSL: number;
 
-  // ── Real candle analysis (requires at least 3 candles) ──────────────────
-  if (candles.length >= 3) {
-    const recent = candles.slice(-6); // last 6 one-minute candles
-    const last   = recent[recent.length - 1]!;
-    const prev   = recent[recent.length - 2]!;
-
-    const body       = Math.abs(last.close - last.open);
-    const range      = last.high - last.low;
-    const upperWick  = last.high - Math.max(last.open, last.close);
-    const lowerWick  = Math.min(last.open, last.close) - last.low;
-    const bullishBar = last.close > last.open;
-    const bearishBar = last.close < last.open;
-
-    // ── Pin Bar ─────────────────────────────────────────────────────────────
-    // Long tail into zone with small body
-    if (range > 0) {
-      const wickRatio = isLong ? lowerWick / range : upperWick / range;
-      const bodyRatio = body / range;
-      if (wickRatio >= 0.55 && bodyRatio <= 0.35) {
-        const isBullishPin = isLong && bullishBar;
-        const isBearishPin = !isLong && bearishBar;
-        if (isBullishPin || isBearishPin) {
-          return { pattern: "pin_bar", strength: "strong", confirmed: true };
-        }
-        // Opposite-colour pin still valid but moderate
-        if (wickRatio >= 0.65) {
-          return { pattern: "pin_bar", strength: "moderate", confirmed: true };
-        }
-      }
-    }
-
-    // ── Engulfing ───────────────────────────────────────────────────────────
-    const prevBody = Math.abs(prev.close - prev.open);
-    const prevBull = prev.close > prev.open;
-    const engulfsBull = isLong  && bullishBar && !prevBull && last.open <= prev.close && last.close >= prev.open;
-    const engulfsBear = !isLong && bearishBar && prevBull  && last.open >= prev.close && last.close <= prev.open;
-    if ((engulfsBull || engulfsBear) && body >= prevBody * 1.1) {
-      return { pattern: "engulfing", strength: body >= prevBody * 1.5 ? "strong" : "moderate", confirmed: true };
-    }
-
-    // ── Momentum (3-candle run) ──────────────────────────────────────────────
-    if (recent.length >= 3) {
-      const last3 = recent.slice(-3);
-      const allBull = last3.every(c => c.close > c.open);
-      const allBear = last3.every(c => c.close < c.open);
-      if ((isLong && allBull) || (!isLong && allBear)) {
-        // Confirm bodies are not shrinking (not a weakening push)
-        const bodies = last3.map(c => Math.abs(c.close - c.open));
-        const growing = bodies[2]! >= bodies[0]! * 0.7;
-        return { pattern: "momentum", strength: growing ? "strong" : "moderate", confirmed: true };
-      }
-    }
-
-    // ── Rejection wick (any candle with a wick back into zone) ──────────────
-    if (range > 0) {
-      const rejectionWick = isLong ? lowerWick / range : upperWick / range;
-      if (rejectionWick >= 0.4 && zoneDist <= 4) {
-        return { pattern: "rejection", strength: "moderate", confirmed: true };
-      }
-    }
-
-    // ── SWEEP with any reversal-direction close ──────────────────────────────
-    if (zoneStatus === "SWEEP") {
-      const reversalClose = isLong ? last.close > last.open : last.close < last.open;
-      if (reversalClose) {
-        return { pattern: "rejection", strength: body > spread * 1.5 ? "moderate" : "weak", confirmed: true };
-      }
-    }
-
-    // Candles available but no pattern confirmed
-    return { pattern: "weak", strength: "weak", confirmed: false };
+  if (isLong) {
+    const slBelowOB = ob.low - 2.0;
+    const slBelowSwing = structure30m.lastSwingLow - 1.0;
+    structureSL = Math.max(slBelowOB, slBelowSwing - 5.0);
+  } else {
+    const slAboveOB = ob.high + 2.0;
+    const slAboveSwing = structure30m.lastSwingHigh + 1.0;
+    structureSL = Math.min(slAboveOB, slAboveSwing + 5.0);
   }
 
-  // ── Velocity fallback (no candle data) ───────────────────────────────────
-  const ctx = getPriceContext();
-  const spreadActive   = spread > 2.0;
-  const spreadModerate = spread >= 1.0 && spread <= 2.0;
-  const spreadQuiet    = spread < 1.0;
-  const veryClose      = zoneDist <= 1.5;
-  const closeToZone    = zoneDist <= 3.5;
-  const velocityReverts = isLong ? ctx.velocity > 0.05 : ctx.velocity < -0.05;
-  const strongMomentum  = Math.abs(ctx.velocity) > 0.15 && ctx.consistent;
+  const slDist = Math.abs(entry - structureSL);
+  // Day trading SL: minimum $25, maximum $45
+  const finalDist = Math.max(25, Math.min(slDist, 45));
+  const finalSL = isLong ? entry - finalDist : entry + finalDist;
 
-  if (zoneStatus === "SWEEP") {
-    if (spreadActive && veryClose && velocityReverts) return { pattern: "pin_bar",   strength: "strong",   confirmed: true };
-    if ((spreadActive || spreadModerate) && closeToZone) return { pattern: "rejection", strength: "moderate", confirmed: true };
-    return { pattern: "rejection", strength: "moderate", confirmed: true };
-  }
-  if (zoneStatus === "AT_LEVEL") {
-    if (spreadActive && veryClose && velocityReverts)   return { pattern: "engulfing", strength: "strong",   confirmed: true };
-    if (spreadActive && closeToZone && strongMomentum)  return { pattern: "momentum",  strength: "strong",   confirmed: true };
-    if (spreadActive && closeToZone)                    return { pattern: "momentum",  strength: "moderate", confirmed: true };
-    if (spreadModerate && closeToZone && velocityReverts) return { pattern: "pin_bar", strength: "moderate", confirmed: true };
-    if (spreadModerate && closeToZone)                  return { pattern: "rejection", strength: "moderate", confirmed: true };
-    if (spreadQuiet && veryClose && velocityReverts)    return { pattern: "pin_bar",   strength: "weak",     confirmed: true };
-    return { pattern: "weak", strength: "weak", confirmed: false };
-  }
-  // ENTERING
-  if (strongMomentum && closeToZone && velocityReverts) return { pattern: "momentum", strength: "strong",   confirmed: true };
-  if (spreadActive && closeToZone)                      return { pattern: "momentum", strength: "strong",   confirmed: true };
-  if (spreadModerate && closeToZone && velocityReverts) return { pattern: "momentum", strength: "moderate", confirmed: true };
-  if (spreadModerate && closeToZone)                    return { pattern: "momentum", strength: "moderate", confirmed: true };
-  if (spreadQuiet && closeToZone)                       return { pattern: "momentum", strength: "weak",     confirmed: true };
-  return { pattern: "weak", strength: "weak", confirmed: false };
+  return { sl: Math.round(finalSL * 100) / 100, slDistance: Math.round(finalDist * 100) / 100 };
 }
 
-// ── Market Structure Analysis ────────────────────────────────────────────────
-async function analyzeMarketStructure(
-  priceData: { price: number; spread: number }
-): Promise<{
-  htfBias: "bullish" | "bearish" | "neutral";
-  pullbackEnding: boolean;
-  momentum: "strong" | "moderate" | "weak";
-}> {
-  const price = priceData.price;
-  const spread = priceData.spread;
-
-  const htfBias = getHTFBias(price);
-  const ctx = getPriceContext();
-
-  // Nearest level distance
-  let nearestDist = Infinity;
-  for (const [, info] of Object.entries(LEVELS)) {
-    const dist = Math.abs(price - info.price);
-    if (dist < nearestDist) nearestDist = dist;
-  }
-
-  const pullbackEnding = ctx.tickCount >= 3 && ctx.consistent && nearestDist < 5;
-  let momentum: "strong" | "moderate" | "weak" = "weak";
-  if (Math.abs(ctx.velocity) > 0.2 && ctx.consistent) momentum = "strong";
-  else if (Math.abs(ctx.velocity) > 0.08 || spread > 1.5) momentum = "moderate";
-
-  return { htfBias, pullbackEnding, momentum };
+function calculateSMCTP(
+  entry: number,
+  direction: "LONG" | "SHORT",
+  slDistance: number,
+  _structure4h: MarketStructure
+): { tp1: number; tp2: number; tp3: number } {
+  const isLong = direction === "LONG";
+  const tp1 = isLong ? entry + slDistance * 1.5 : entry - slDistance * 1.5;
+  const tp2 = isLong ? entry + slDistance * 2.5 : entry - slDistance * 2.5;
+  const tp3 = isLong ? entry + slDistance * 4.0 : entry - slDistance * 4.0;
+  return {
+    tp1: Math.round(tp1 * 100) / 100,
+    tp2: Math.round(tp2 * 100) / 100,
+    tp3: Math.round(tp3 * 100) / 100,
+  };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FORMAT HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+export function formatSMCSignal(
+  direction: string, entry: number, sl: number, slDist: number,
+  tp1: number, tp2: number, tp3: number, currentPrice: number,
+  trend: string, obType: string, choch: boolean, sweep: string,
+  session: string, priority: string
+): string {
+  const isLong = direction.includes("LONG");
+  const arrow = isLong ? "🟢" : "🔴";
+  const action = isLong ? "BUY" : "SELL";
+  const chochText = choch ? " ✅ CHoCH" : "";
+  const sweepText = sweep !== "none" ? ` | Sweep: ${sweep}` : "";
+
+  return `<b>📊 SMC DAY TRADE — XAU/USD</b>
+${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
+
+<b>SL:</b> $${sl.toFixed(2)} (${slDist.toFixed(1)} pts)
+<b>TP1:</b> $${tp1.toFixed(2)} (1.5R)
+<b>TP2:</b> $${tp2.toFixed(2)} (2.5R)
+<b>TP3:</b> $${tp3.toFixed(2)} (4R)
+
+<b>Trend:</b> ${trend.toUpperCase()} (4H Structure)
+<b>Entry:</b> ${obType} Order Block
+<b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
+<b>Session:</b> ${session} (${priority})
+
+<b>Max 2 trades/day | Trend direction only</b>`;
+}
+
+export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
+  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
+  const tpField = tpLevel.toLowerCase() as "tp1" | "tp2" | "tp3";
+  const action = tpLevel === "TP1" ? "Close half, SL to BE" : tpLevel === "TP3" ? "🏆 TRADE COMPLETE" : "Let it run";
+  return `<b>✅ ${tpLevel} HIT — $${currentPrice.toFixed(2)}</b>
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+${tpLevel}: $${trade[tpField].toFixed(2)}
+${action}`;
+}
+
+export function formatSLHit(trade: { direction: string; entry: number }, currentPrice: number): string {
+  return `<b>❌ SL HIT — $${currentPrice.toFixed(2)}</b>
+🔴 ${trade.direction} @ $${trade.entry.toFixed(2)}
+Wait for next A+ setup. Do NOT revenge trade.`;
+}
+
+export function formatBEHit(trade: { direction: string; entry: number; tp1: number; tp2Hit?: boolean }, currentPrice: number): string {
+  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
+  if (trade.tp2Hit) {
+    return `<b>🎯 TRAILING STOP HIT — $${currentPrice.toFixed(2)}</b>
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+SL moved to TP2: $${trade.tp1.toFixed(2)}
+Let it run to TP3 or let the market decide.`;
+  }
+  return `<b>🛡️ BREAK-EVEN — $${currentPrice.toFixed(2)}</b>
+${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
+TP1 Hit. SL moved to $${trade.entry.toFixed(2)} (BE)
+Risk-free trade. Let it run to TP2/TP3.`;
+}
+
+// ─── Session Info ────────────────────────────────────────────────────────────
 export function getSessionInfo(): { session: string; priority: string; note: string } {
   const now = new Date();
   const hour = now.getUTCHours();
-  if (hour >= 1 && hour < 7)   return { session: "Asian Session",       priority: "LOW",    note: "Lower liquidity, range-bound setups" };
-  if (hour >= 8 && hour < 12)  return { session: "London Open",          priority: "HIGH",   note: "Best for breakouts and trend entries" };
-  if (hour >= 13 && hour < 16) return { session: "London-NY Overlap",    priority: "BEST",   note: "Highest liquidity, strongest moves" };
-  if (hour >= 16 && hour < 20) return { session: "NY Session",           priority: "HIGH",   note: "Strong momentum, good for follow-through" };
-  return { session: "Late NY / Pre-Asian", priority: "MEDIUM", note: "Lower volume, range trades only" };
+  if (hour >= 0 && hour < 7) return { session: "Asian Session", priority: "LOW", note: "Thin markets" };
+  if (hour >= 7 && hour < 12) return { session: "London Session", priority: "HIGH", note: "Strong momentum" };
+  if (hour >= 12 && hour < 16) return { session: "London-NY Overlap", priority: "HIGHEST", note: "Peak volatility" };
+  if (hour >= 16 && hour < 21) return { session: "NY Session", priority: "HIGH", note: "Momentum continuation" };
+  return { session: "Dead Zone", priority: "LOW", note: "Avoid trading" };
 }
 
+// ─── News Filter ─────────────────────────────────────────────────────────────
 export function isNewsSafe(): { safe: boolean; message: string } {
-  const now  = new Date();
-  const day  = now.getUTCDay();
+  const now = new Date();
+  const day = now.getUTCDay();
   const hour = now.getUTCHours();
   const date = now.getUTCDate();
-
-  if (day === 3 && hour >= 17 && hour <= 19) return { safe: false, message: "Fed Decision Window — NO TRADES" };
-  if (day === 5 && hour >= 13 && hour <= 15 && date <= 7) return { safe: false, message: "NFP Window — NO TRADES" };
-  if (date >= 14 && date <= 16 && hour >= 13 && hour <= 15) return { safe: false, message: "CPI Window — CAUTION" };
+  if (day === 0 || day === 6) return { safe: false, message: "Market Closed" };
+  if (day === 5 && hour >= 20) return { safe: false, message: "Friday Close approaching" };
+  if (day === 3 && hour >= 17 && hour <= 20) return { safe: false, message: "FOMC Window" };
+  if (day === 5 && date <= 7 && hour >= 12 && hour <= 15) return { safe: false, message: "NFP Window — NO TRADES" };
+  if (date >= 10 && date <= 16 && hour >= 12 && hour <= 14) return { safe: false, message: "Inflation Data Window" };
   return { safe: true, message: "No news events — safe to trade" };
 }
 
-// ── Telegram Sender ─────────────────────────────────────────────────────────
+// ─── Telegram Sender ─────────────────────────────────────────────────────────
 export async function sendTelegram(text: string, type: string = "signal"): Promise<boolean> {
   try {
     const resp = await fetch(`https://api.telegram.org/bot${TOKEN}/sendMessage`, {
@@ -420,32 +492,21 @@ export async function sendTelegram(text: string, type: string = "signal"): Promi
       body: JSON.stringify({ chat_id: CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
     });
     const success = resp.status === 200;
-    try {
-      await db.insert(telegramLog).values({ type, content: text.substring(0, 4000), success });
-    } catch (dbErr) {
-      console.error("[Bot] Failed to log telegram message:", dbErr);
-    }
+    try { await db.insert(telegramLog).values({ type, content: text.substring(0, 4000), success }); } catch {}
     return success;
   } catch (e) {
-    try {
-      await db.insert(telegramLog).values({ type, content: `Error: ${e}`, success: false });
-    } catch {}
+    try { await db.insert(telegramLog).values({ type, content: `Error: ${e}`, success: false }); } catch {}
     return false;
   }
 }
 
-// ── Fetch Price ─────────────────────────────────────────────────────────────
-// Try all three sources in parallel; return the first successful result.
+// ─── Fetch Price ─────────────────────────────────────────────────────────────
 export async function fetchGoldData(): Promise<{ price: number; bid: number; ask: number; spread: number; source: string } | null> {
   type PriceData = { price: number; bid: number; ask: number; spread: number; source: string };
-
   const trySwissquote = async (): Promise<PriceData> => {
-    const resp = await fetch(
-      "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
-      { signal: AbortSignal.timeout(4000) }
-    );
+    const resp = await fetch("https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD", { signal: AbortSignal.timeout(4000) });
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json() as any;
+    const j = await resp.json() as Array<{ spreadProfilePrices: Array<{ bid: string; ask: string }> }>;
     const profiles = j?.[0]?.spreadProfilePrices || [];
     if (!profiles.length) throw new Error("no profiles");
     const bid = parseFloat(profiles[0].bid);
@@ -453,446 +514,295 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
     if (!bid || !ask) throw new Error("bad prices");
     return { price: (bid + ask) / 2, bid, ask, spread: ask - bid, source: "Swissquote" };
   };
-
   const tryGoldprice = async (): Promise<PriceData> => {
-    const resp = await fetch(
-      "https://data-asg.goldprice.org/dbXRates/USD",
-      { signal: AbortSignal.timeout(4000) }
-    );
+    const resp = await fetch("https://data-asg.goldprice.org/dbXRates/USD", { signal: AbortSignal.timeout(4000) });
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json() as any;
-    const price = parseFloat(j?.items?.[0]?.xauPrice);
+    const j = await resp.json() as { items?: Array<{ xauPrice: string }> };
+    const price = parseFloat(j?.items?.[0]?.xauPrice ?? "");
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "goldprice.org" };
   };
-
   const tryFrankfurter = async (): Promise<PriceData> => {
-    const resp = await fetch(
-      "https://api.frankfurter.app/latest?from=XAU&to=USD",
-      { signal: AbortSignal.timeout(4000) }
-    );
+    const resp = await fetch("https://api.frankfurter.app/latest?from=XAU&to=USD", { signal: AbortSignal.timeout(4000) });
     if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json() as any;
-    const price = parseFloat(j?.rates?.USD);
+    const j = await resp.json() as { rates?: { USD?: number } };
+    const price = parseFloat(String(j?.rates?.USD ?? ""));
     if (!price) throw new Error("no price");
     return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "frankfurter" };
   };
-
-  // Race all three — fastest successful one wins
   const result = await Promise.any([trySwissquote(), tryGoldprice(), tryFrankfurter()]).catch(() => null);
-  if (result) {
-    recordPriceTick(result.price, result.spread);
-    return result;
-  }
+  if (result) { recordPriceTick(result.price, result.spread); return result; }
   return null;
 }
 
-// ── Format Messages ─────────────────────────────────────────────────────────
-export function formatSignal(
-  direction: string, zoneLabel: string, tier: string,
-  entry: number, sl: number, slDist: number,
-  tp1: number, tp2: number, tp3: number,
-  currentPrice: number, session: string, priority: string,
-  reason: string, status: string,
-  setupId?: number
-): string {
-  const arrow = direction.includes("LONG") ? "🟢" : "🔴";
-  const isEntering = status === "ENTERING";
-  const action = isEntering ? "SETUP FORMING" : "ENTER NOW";
-  const urgency = isEntering ? "⚠️" : "🚨";
-  const sessionShort = session.split(" ")[0];
-  const displayId = setupId ? String(setupId % 100).padStart(2, '0') : "??";
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN SMC SCAN
+// ═══════════════════════════════════════════════════════════════════════════════
 
-  return `<b>${urgency} ${arrow} XAU/USD — ${action} (#${displayId})</b>
-<b>Direction:</b> ${arrow} ${direction} | ${sessionShort} (${priority})
-<b>Zone:</b> ${zoneLabel}
-<b>Entry:</b> $${entry.toFixed(2)} | <b>SL:</b> $${sl.toFixed(2)}
-<b>TP1:</b> $${tp1.toFixed(2)} | <b>TP2:</b> $${tp2.toFixed(2)} | <b>TP3:</b> $${tp3.toFixed(2)}${isEntering ? "" : `\nReply <b>IN ${displayId}</b> to track`}`;
-}
+let lastSignaledSetupId: number | null = null;
+let lastSignaledAt = 0;
 
-export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
-  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
-  const tpField = tpLevel.toLowerCase() as "tp1" | "tp2" | "tp3";
-  const target = trade[tpField];
-  const action = tpLevel === "TP1" ? "Close half, SL to BE" : tpLevel === "TP3" ? "🏆 TRADE COMPLETE" : "Let it run";
-  return `<b>✅ ${tpLevel} HIT — $${currentPrice.toFixed(2)}</b>
-${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
-Target ${tpLevel}: $${target.toFixed(2)}
-${action}`;
-}
-
-export function formatSLHit(trade: { direction: string; entry: number; sl: number }, currentPrice: number): string {
-  const arrow = trade.direction.includes("LONG") ? "🟢" : "🔴";
-  return `<b>❌ SL HIT — $${currentPrice.toFixed(2)}</b>
-${arrow} ${trade.direction} @ $${trade.entry.toFixed(2)}
-Stop Loss: $${trade.sl.toFixed(2)}
-Wait for next A+ setup. Do NOT revenge trade.`;
-}
-
-// ── Trade Constraints ────────────────────────────────────────────────────────
-async function getTradeConstraints(): Promise<{
-  blockedDirections: Set<string>;
-  blockedZoneKeys: Set<string>;
-}> {
-  const openTrades = await db
-    .select()
-    .from(activeTrades)
-    .where(eq(activeTrades.closed, false));
-
-  const directionCounts = new Map<string, number>();
-  const blockedZoneKeys = new Set<string>();
-
-  for (const trade of openTrades) {
-    const dir = trade.direction.includes("LONG") ? "LONG" : "SHORT";
-    directionCounts.set(dir, (directionCounts.get(dir) || 0) + 1);
-    blockedZoneKeys.add(trade.zone);
-  }
-
-  const blockedDirections = new Set<string>();
-  for (const [dir, count] of directionCounts.entries()) {
-    if (count >= 2) blockedDirections.add(dir);
-  }
-
-  return { blockedDirections, blockedZoneKeys };
-}
-
-// ── Calculate TP/SL from zone level ─────────────────────────────────────────
-function calculateLevels(
-  direction: "LONG" | "SHORT",
-  zonePrice: number,
-  spread: number
-): { entry: number; sl: number; slDistance: number; tp1: number; tp2: number; tp3: number } {
-  const slBuffer = Math.max(spread * 2, 1.5);
-  const isLong = direction === "LONG";
-
-  const entry = isLong ? zonePrice + spread * 0.3 : zonePrice - spread * 0.3;
-  const sl = isLong ? zonePrice - slBuffer : zonePrice + slBuffer;
-  const slDistance = Math.abs(entry - sl);
-
-  const tp1 = isLong ? entry + slDistance * 1.5 : entry - slDistance * 1.5;
-  const tp2 = isLong ? entry + slDistance * 2.5 : entry - slDistance * 2.5;
-  const tp3 = isLong ? entry + slDistance * 4.0 : entry - slDistance * 4.0;
-
-  return { entry, sl, slDistance, tp1, tp2, tp3 };
-}
-
-// ── Scan Zones ───────────────────────────────────────────────────────────────
-export async function scanZones(priceData: { price: number; bid: number; ask: number; spread: number; source: string }): Promise<ScanResult> {
+export async function scanSMCZones(
+  priceData: { price: number; bid: number; ask: number; spread: number; source: string }
+): Promise<ScanResult> {
   const price = priceData.price;
   const spread = priceData.spread;
 
+  // Gate 1: News
   const { safe, message: newsMsg } = isNewsSafe();
-  if (!safe) {
-    console.log("[Bot] News blackout — skipping scan");
-    return { setupFound: false, count: 0, reason: `News blackout — ${newsMsg}` };
-  }
+  if (!safe) return { setupFound: false, count: 0, reason: `News blackout — ${newsMsg}` };
 
-  // Refresh levels if stale (non-blocking on failure — uses last known levels)
-  await ensureLevelsRefreshed();
-
-  // Fetch real 1-min candles once for the whole scan
-  const recentCandles = await getRecentMinuteCandles();
-
-  const { blockedDirections, blockedZoneKeys } = await getTradeConstraints();
-  const marketStructure = await analyzeMarketStructure(priceData);
+  // Gate 2: Session
   const { session, priority } = getSessionInfo();
+  if (priority === "LOW") return { setupFound: false, count: 0, reason: `Outside active hours — ${session}` };
 
-  // Rejection counters for reporting
-  let htfRejected = 0;
-  let cooldownRejected = 0;
-  let constraintRejected = 0;
-  let candleRejected = 0;
+  // Gate 3: Spread
+  if (spread > 3.0) return { setupFound: false, count: 0, reason: `Spread too wide (${spread.toFixed(2)})` };
 
-  // Determine active zones near price
-  const activeZones: Array<{
-    key: string;
-    label: string;
-    tier: string;
-    price: number;
-    type: "LONG" | "SHORT";
-    dist: number;
-    status: string;
-  }> = [];
-
-  for (const [key, level] of Object.entries(LEVELS)) {
-    const dist = Math.abs(price - level.price);
-    const thresh = getZoneThreshold(level.tier);
-    const isSupport = key.startsWith("s");
-    const direction: "LONG" | "SHORT" = isSupport ? "LONG" : "SHORT";
-
-    // Determine zone status
-    let status: string | null = null;
-    if (dist <= thresh.sweep) {
-      status = "SWEEP";
-    } else if (dist <= thresh.atLevel) {
-      status = "AT_LEVEL";
-    } else if (dist <= thresh.entering) {
-      status = "ENTERING";
-    }
-
-    if (!status) continue;
-
-    // HTF bias filter: only gate ENTERING setups — AT_LEVEL and SWEEP are
-    // immediate price-action setups and should not be blocked by HTF bias.
-    const htf = marketStructure.htfBias;
-    if (htf !== "neutral" && status === "ENTERING") {
-      if (direction === "LONG" && htf === "bearish") { htfRejected++; continue; }
-      if (direction === "SHORT" && htf === "bullish") { htfRejected++; continue; }
-    }
-
-    activeZones.push({ key, label: level.label, tier: level.tier, price: level.price, type: direction, dist, status });
+  // Gate 4: Global cooldown
+  const timeSinceLast = Date.now() - lastGlobalSignalTime;
+  if (timeSinceLast < GLOBAL_COOLDOWN_MS) {
+    const remaining = Math.ceil((GLOBAL_COOLDOWN_MS - timeSinceLast) / 60000);
+    return { setupFound: false, count: 0, reason: `Global cooldown (${remaining}m)` };
   }
 
-  if (activeZones.length === 0) {
-    const reason = htfRejected > 0
-      ? "HTF bias mismatch — price not at a level aligned with trend"
-      : "Price not at valid support/resistance";
-    return { setupFound: false, count: 0, reason };
-  }
+  // Gate 5: Trade limits
+  const { blockedDirections, blockedZoneKeys, todayTradeCount } = await getTradeConstraints();
+  if (todayTradeCount >= 2) return { setupFound: false, count: 0, reason: "Daily limit reached (2/2)" };
 
-  // Sort by distance (closest first)
-  activeZones.sort((a, b) => a.dist - b.dist);
+  // STEP 1: 4H Structure
+  const structure4h = analyze4HStructure(await getRecent4HourCandles());
+  if (structure4h.trend === "neutral") return { setupFound: false, count: 0, reason: "4H neutral — no clear trend" };
 
-  const signalsToSave: Array<{ direction: string; zoneKey: string }> = [];
+  // STEP 2: 30M Order Blocks
+  const candles30m = await getRecent30MinCandles();
+  const orderBlocks = detectOrderBlocks(candles30m);
+  const validOBs = orderBlocks.filter(ob =>
+    (structure4h.trend === "bullish" && ob.direction === "LONG") ||
+    (structure4h.trend === "bearish" && ob.direction === "SHORT")
+  );
 
-  for (const zone of activeZones) {
-    if (isZoneOnCooldown(zone.key)) { cooldownRejected++; continue; }
-    if (blockedZoneKeys.has(zone.key)) { constraintRejected++; continue; }
+  if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${structure4h.trend} direction` };
+  validOBs.sort((a, b) => a.distance - b.distance);
 
-    const dir = zone.type.includes("LONG") ? "LONG" : "SHORT";
-    if (blockedDirections.has(dir)) { constraintRejected++; continue; }
+  // STEP 3: 30M Structure + CHoCH + Sweep
+  const structure30m = analyze30MStructure(candles30m);
+  const choch = detectCHoCH(candles30m);
+  const sweep = detectLiquiditySweep(candles30m, structure4h.lastSwingHigh, structure4h.lastSwingLow);
 
-    const candle = detectCandleSignal(price, spread, zone.dist, zone.status, zone.type, recentCandles);
-    if (!candle.confirmed) { candleRejected++; continue; }
+  for (const ob of validOBs) {
+    const zoneKey = `smc_${ob.direction.toLowerCase()}_${ob.index}`;
+    if (blockedZoneKeys.has(zoneKey)) continue;
+    if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
-    const { entry, sl, slDistance, tp1, tp2, tp3 } = calculateLevels(zone.type, zone.price, spread);
+    const entryPrice = ob.price;
+    if (ob.distance > 15 || ob.distance < 2) continue;
 
-    const reasons: Record<string, string> = {
-      "ENTERING": `Price entering ${zone.label} — ${candle.pattern} setup (${candle.strength})`,
-      "AT_LEVEL": `Price AT ${zone.label} — ${candle.pattern} signal (${candle.strength})`,
-      "SWEEP": `Liquidity sweep at ${zone.label} — reversal setup (${candle.strength})`,
-    };
+    const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
+    const isLong = ob.direction === "LONG";
+    const slBreached = isLong ? price <= sl : price >= sl;
+    if (slBreached) continue;
 
-    const biasNote = marketStructure.htfBias !== "neutral"
-      ? ` | HTF Bias: ${marketStructure.htfBias}`
-      : "";
-    const fullReason = (reasons[zone.status] || "Setup detected at key level.") + biasNote;
+    const proximityToSL = isLong ? (price - sl) : (sl - price);
+    if (proximityToSL < (slDistance * 0.2)) continue;
 
-    signalsToSave.push({ direction: zone.type, zoneKey: zone.key });
-    markZoneCooldown(zone.key);
+    if (blockedDirections.has(ob.direction)) continue;
 
-    let setupId: number | undefined;
+    const { tp1, tp2, tp3 } = calculateSMCTP(entryPrice, ob.direction, slDistance, structure4h);
+    markZoneCooldown(zoneKey);
+
+    const obType = ob.direction === "LONG" ? "Bullish" : "Bearish";
+    const msg = formatSMCSignal(
+      ob.direction, entryPrice, sl, slDistance, tp1, tp2, tp3,
+      price, structure4h.trend, obType, choch.occurred, sweep, session, priority
+    );
+
     try {
-      const [insertedSetup] = await db.insert(activeSetups).values({
-        zoneKey: zone.key,
-        direction: zone.type,
-        zoneLabel: zone.label,
-        zoneTier: zone.tier,
-        entry,
-        sl,
-        slDistance,
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-        session,
-        priority,
-      }).returning({ id: activeSetups.id });
-      
-      setupId = insertedSetup?.id;
-
       await db.insert(signals).values({
-        direction: zone.type,
-        zoneLabel: zone.label,
-        zoneTier: zone.tier,
-        entry,
-        sl,
-        slDistance,
-        tp1,
-        tp2,
-        tp3,
-        currentPrice: price,
-        session,
-        priority,
-        reason: fullReason,
-        status: zone.status as "ENTERING" | "AT_LEVEL" | "SWEEP",
-        zoneKey: zone.key,
+        direction: ob.direction,
+        zoneLabel: `${obType} OB (30M) | 4H ${structure4h.trend}`,
+        zoneTier: "major", entry: entryPrice, sl, slDistance,
+        tp1, tp2, tp3, currentPrice: price, session,
+        priority: "A+",
+        reason: `SMC: ${obType} OB + 4H ${structure4h.trend} | CHoCH: ${choch.occurred} | Sweep: ${sweep}`,
+        status: "AT_LEVEL", zoneKey,
+      });
+      await db.insert(activeSetups).values({
+        zoneKey, direction: ob.direction,
+        zoneLabel: `${obType} OB (30M)`, zoneTier: "major",
+        entry: entryPrice, sl, slDistance, tp1, tp2, tp3,
+        currentPrice: price, status: "AT_LEVEL", session,
+        priority: "A+", detectedAt: new Date(),
       });
     } catch (err) {
-      console.error("[Bot] DB insert error:", err);
+      console.error("[Bot] SMC signal insert error:", err);
     }
 
-    const msg = formatSignal(zone.type, zone.label, zone.tier, entry, sl, slDistance, tp1, tp2, tp3, price, session, priority, fullReason, zone.status, setupId);
-    await sendTelegram(msg, "signal");
+    await sendTelegram(msg, "smc_signal");
+    lastGlobalSignalTime = Date.now();
+
+    return { setupFound: true, count: 1, reason: `SMC: ${obType} OB at $${entryPrice.toFixed(2)} | 4H ${structure4h.trend}` };
   }
 
-  // Direction shift alert
-  if (signalsToSave.length > 0) {
-    try {
-      const lastTrade = await db.select().from(activeTrades).orderBy(desc(activeTrades.confirmedAt)).limit(1);
-      if (lastTrade.length > 0) {
-        const lastTradeDir = lastTrade[0]!.direction;
-        const newDir = signalsToSave[0]!.direction;
-        if (
-          (lastTradeDir.includes("LONG") && newDir.includes("SHORT")) ||
-          (lastTradeDir.includes("SHORT") && newDir.includes("LONG"))
-        ) {
-          await sendTelegram(
-            `<b>⚠️ XAU/USD — DIRECTION SHIFT ALERT</b>\n━━━━━━━━━━━━━━━━━━━━\n<b>Last Trade:</b> ${lastTradeDir.includes("LONG") ? "🟢 LONG" : "🔴 SHORT"}\n<b>Now:</b> ${newDir.includes("LONG") ? "🟢 LONG" : "🔴 SHORT"} setup forming\n\n<b>Action:</b> If you are in the previous trade — CLOSE it now.\nDo NOT hold a losing trade into an opposing setup.`,
-            "shift_alert"
-          );
-        }
-      }
-    } catch (err) {
-      console.error("[Bot] Direction shift alert error:", err);
-    }
-  }
-
-  // Build result
-  if (signalsToSave.length === 0) {
-    let reason = "No valid setup found";
-    if (cooldownRejected > 0 && constraintRejected === 0 && candleRejected === 0 && htfRejected === 0)
-      reason = "Zone recently scanned — cooldown active";
-    else if (constraintRejected > 0 && candleRejected === 0 && htfRejected === 0)
-      reason = "Existing trade already active at this zone";
-    else if (candleRejected > 0 && htfRejected === 0)
-      reason = "Weak confirmation candle — structure not complete";
-    else if (htfRejected > 0 && candleRejected === 0)
-      reason = "HTF bias mismatch — ENTERING setups filtered";
-    else if (htfRejected > 0 || candleRejected > 0)
-      reason = "Setup rejected — HTF bias mismatch or weak candle confirmation";
-    return { setupFound: false, count: 0, reason };
-  }
-
-  return { setupFound: true, count: signalsToSave.length, reason: `${signalsToSave.length} setup(s) found` };
+  return { setupFound: false, count: 0, reason: `No OBs in range | 4H: ${structure4h.trend}` };
 }
 
-// ── Track Active Trades ─────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+
 export async function trackActiveTrades(price: number) {
   try {
     const trades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
-
     for (const trade of trades) {
       const isLong = trade.direction.includes("LONG");
 
-      // Validate price alignment to prevent false exits
-      // If price is > 100 pips away from entry in the WRONG direction, ignore as data glitch
-      const distFromEntry = isLong ? trade.entry - price : price - trade.entry;
-      if (distFromEntry > 100) {
-        console.warn(`[Bot] Ignoring price tick $${price} for ${trade.direction} trade at $${trade.entry} (extreme outlier)`);
+      if (!trade.tp1Hit && (isLong ? price >= trade.tp1 : price <= trade.tp1)) {
+        trade.tp1Hit = true; trade.tp1HitAt = new Date();
+        await db.update(activeTrades).set({ tp1Hit: true, tp1HitAt: new Date(), sl: trade.entry }).where(eq(activeTrades.id, trade.id));
+        await sendTelegram(formatTPHit(trade, "TP1", price), "tp1_hit");
+      }
+      if (!trade.tp2Hit && (isLong ? price >= trade.tp2 : price <= trade.tp2)) {
+        trade.tp2Hit = true; trade.tp2HitAt = new Date();
+        await db.update(activeTrades).set({ tp2Hit: true, tp2HitAt: new Date(), sl: trade.tp2 }).where(eq(activeTrades.id, trade.id));
+        await sendTelegram(formatTPHit(trade, "TP2", price), "tp2_hit");
+      }
+      if (!trade.tp3Hit && (isLong ? price >= trade.tp3 : price <= trade.tp3)) {
+        trade.tp3Hit = true; trade.tp3HitAt = new Date(); trade.closed = true;
+        await db.update(activeTrades).set({ tp3Hit: true, tp3HitAt: new Date(), closed: true }).where(eq(activeTrades.id, trade.id));
+        await sendTelegram(formatTPHit(trade, "TP3", price), "tp3_hit");
         continue;
       }
 
-      if (!trade.tp1Hit) {
-        const tp1Reached = isLong ? price >= trade.tp1 : price <= trade.tp1;
-        if (tp1Reached) {
-          await db.update(activeTrades).set({ tp1Hit: true, tp1HitAt: new Date() }).where(eq(activeTrades.id, trade.id));
-          await sendTelegram(formatTPHit(trade, "TP1", price), "tp_hit");
-        }
-      }
-
-      if (trade.tp1Hit && !trade.tp2Hit) {
-        const tp2Reached = isLong ? price >= trade.tp2 : price <= trade.tp2;
-        if (tp2Reached) {
-          await db.update(activeTrades).set({ tp2Hit: true, tp2HitAt: new Date() }).where(eq(activeTrades.id, trade.id));
-          await sendTelegram(formatTPHit(trade, "TP2", price), "tp_hit");
-        }
-      }
-
-      if (trade.tp1Hit && !trade.tp3Hit) {
-        const tp3Reached = isLong ? price >= trade.tp3 : price <= trade.tp3;
-        if (tp3Reached) {
-          await db.update(activeTrades).set({ tp3Hit: true, tp3HitAt: new Date(), closed: true }).where(eq(activeTrades.id, trade.id));
-          await sendTelegram(formatTPHit(trade, "TP3", price), "tp_hit");
-          continue;
-        }
-      }
-
-      if (!trade.slHit) {
-        const slReached = isLong ? price <= trade.sl : price >= trade.sl;
-        if (slReached) {
+      const currentSL = trade.beHit ? trade.entry : trade.sl;
+      const slHit = isLong ? price <= currentSL : price >= currentSL;
+      if (slHit && !trade.closed) {
+        const isBE = trade.tp1Hit;
+        if (isBE) {
+          await db.update(activeTrades).set({ beHit: true, beHitAt: new Date(), closed: true }).where(eq(activeTrades.id, trade.id));
+          await sendTelegram(formatBEHit(trade, price), "be_hit");
+        } else {
           await db.update(activeTrades).set({ slHit: true, slHitAt: new Date(), closed: true }).where(eq(activeTrades.id, trade.id));
           await sendTelegram(formatSLHit(trade, price), "sl_hit");
         }
       }
     }
-  } catch (err) {
-    console.error("[Bot] trackActiveTrades error:", err);
-  }
+  } catch (err) { console.error("[Bot] trackActiveTrades error:", err); }
 }
 
-// ── Telegram Command Handler ────────────────────────────────────────────────
-let lastUpdateId = 0;
+export async function expireStaleSetups(price: number) {
+  try {
+    const setups = await db.select().from(activeSetups);
+    for (const setup of setups) {
+      const isLong = setup.direction.includes("LONG");
+      const ageMs = Date.now() - new Date(setup.detectedAt).getTime();
+      const slBreached = isLong ? price <= setup.sl : price >= setup.sl;
+      const tooOld = ageMs > SETUP_MAX_AGE_MS;
+
+      if (slBreached || tooOld) {
+        const reason = slBreached ? "Price hit SL" : "Setup expired (1h)";
+        const arrow = isLong ? "🟢" : "🔴";
+        const gracePeriod = 5 * 60 * 1000;
+        const isWithinGrace = slBreached && ageMs < gracePeriod;
+
+        if (tooOld || (slBreached && !isWithinGrace)) {
+          await db.delete(activeSetups).where(eq(activeSetups.id, setup.id));
+          breachNotifiedSetups.delete(setup.id);
+          const cancelMsg = slBreached
+            ? `<b>⚠️ SMC SETUP STOPPED OUT</b>\nEntry: $${setup.entry.toFixed(2)}\nSL: $${setup.sl.toFixed(2)}\nPrice: $${price.toFixed(2)}`
+            : `<b>⚠️ SMC SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nReason: ${reason}`;
+          await sendTelegram(cancelMsg, "setup_cancelled");
+        } else if (slBreached && isWithinGrace && !breachNotifiedSetups.has(setup.id)) {
+          await sendTelegram(`<b>⚠️ SMC SETUP STOPPED OUT</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nSL: $${setup.sl.toFixed(2)}\n<b>If you already entered, reply "IN" to track.</b>`, "setup_warning");
+          breachNotifiedSetups.add(setup.id);
+        }
+      }
+    }
+  } catch (err) { console.error("[Bot] expireStaleSetups error:", err); }
+}
+
+async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; blockedZoneKeys: Set<string>; todayTradeCount: number }> {
+  let openTrades: any[] = [];
+  let pendingSetups: any[] = [];
+  let allTodayTrades: any[] = [];
+
+  try { openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false)); } catch {}
+  try { pendingSetups = await db.select().from(activeSetups); } catch {}
+
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  try { allTodayTrades = await db.select().from(activeTrades).where(gte(activeTrades.confirmedAt, today)); } catch {}
+
+  const directionCounts = new Map<string, number>();
+  const blockedZoneKeys = new Set<string>();
+
+  for (const t of openTrades) {
+    const dir = t.direction.includes("LONG") ? "LONG" : "SHORT";
+    directionCounts.set(dir, (directionCounts.get(dir) || 0) + 1);
+    blockedZoneKeys.add(t.zone);
+  }
+  for (const s of pendingSetups) { blockedZoneKeys.add(s.zoneKey); blockedZoneKeys.add(s.zoneLabel); }
+
+  const blockedDirections = new Set<string>();
+  for (const [dir, count] of directionCounts.entries()) { if (count >= 2) blockedDirections.add(dir); }
+
+  return { blockedDirections, blockedZoneKeys, todayTradeCount: allTodayTrades.length };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM COMMANDS
+// ═══════════════════════════════════════════════════════════════════════════════
 
 export async function handleTelegramUpdates() {
+  if (!TOKEN || !CHAT_ID) return;
   try {
-    const resp = await fetch(
-      `https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${lastUpdateId + 1}&timeout=1`,
-      { signal: AbortSignal.timeout(10000) }
-    );
+    const resp = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${lastUpdateId + 1}`, { signal: AbortSignal.timeout(8000) });
     if (resp.status !== 200) return;
-    const data = await resp.json() as any;
-    const updates = data.result || [];
+    const j = await resp.json() as { result?: Array<{ update_id: number; message?: { text?: string; message_id?: number } }> };
+    const updates = j?.result ?? [];
+    for (const u of updates) {
+      if (u.update_id <= lastUpdateId) continue;
+      lastUpdateId = u.update_id;
+      const text = u.message?.text?.trim();
+      if (!text) continue;
 
-    for (const update of updates) {
-      lastUpdateId = update.update_id;
-      const msg = update.message || {};
-      const chatId = msg.chat?.id;
-      const text = (msg.text || "").trim().toUpperCase();
+      const isConfirm = text.includes("IN") && (text.startsWith("IN") || text.includes("I'M IN") || text.includes("IM IN"));
 
-      if (String(chatId) !== String(CHAT_ID)) continue;
-
-      const cmdMatch = text.match(/^IN(\s+(\d+))?$/);
-      if (cmdMatch) {
-        const input = cmdMatch[2] ? parseInt(cmdMatch[2]) : null;
-        await handleConfirmedCommand(input);
-        continue;
-      }
       if (text === "ALIVE") {
-        await handleAliveCommand();
+        const data = await fetchGoldData();
+        const price = data?.price || 0;
+        const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
+        const status = openTrades.length > 0 ? `${openTrades.length} active trade(s)` : "No active trades";
+        await sendTelegram(
+          `<b>✅ Ricky Bot is ALIVE</b>
+SMC Day Trading Mode
+XAU/USD: $${price.toFixed(2)}
+${status}
+Mode: 4H Trend + 30M OB + CHoCH
+Scan: Every 3 min | Max 2 trades/day`, "alive"
+        );
         continue;
       }
-      if (text === "STATUS") {
-        await handleStatusCommand();
-        continue;
-      }
-      if (text === "CLOSE ALL") {
-        await handleCloseAllCommand();
+
+      if (text === "STATUS") { await handleStatusCommand(); continue; }
+      if (text === "CLOSE ALL") { await handleCloseAllCommand(); continue; }
+
+      if (isConfirm) {
+        const match = text.match(/\d+/);
+        const index = match ? parseInt(match[0]) - 1 : null;
+        await handleConfirmedCommand(index);
         continue;
       }
     }
-  } catch (err) {
-    console.error("[Bot] handleTelegramUpdates error:", err);
-  }
-}
-
-async function handleAliveCommand() {
-  const data = await fetchGoldData();
-  const price = data?.price || 0;
-  const { session, priority } = getSessionInfo();
-  const { safe, message: newsMsg } = isNewsSafe();
-  const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
-  const msg = `<b>✅ Bot Alive</b>
-XAU/USD: $${price.toFixed(2)}
-Session: ${session} (${priority})
-News: ${safe ? "✅ Safe" : "⚠️ " + newsMsg}
-Open Trades: ${openTrades.length}
-Time: ${new Date().toISOString()}`;
-  await sendTelegram(msg, "alive");
+  } catch (err) { console.error("[Bot] handleTelegramUpdates error:", err); }
 }
 
 async function handleStatusCommand() {
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
   const data = await fetchGoldData();
   const price = data?.price || 0;
-
-  if (openTrades.length === 0) {
-    await sendTelegram(`<b>📊 Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}`, "status");
-    return;
-  }
-
-  let statusMsg = `<b>📊 Active Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
+  if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 4H+30M Day Trading`, "status"); return; }
+  let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
     const arrow = isLong ? "🟢" : "🔴";
@@ -906,156 +816,97 @@ async function handleStatusCommand() {
 
 async function handleCloseAllCommand() {
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
-  if (openTrades.length === 0) {
-    await sendTelegram("No active trades to close.", "close_all");
-    return;
-  }
+  if (openTrades.length === 0) { await sendTelegram("No active trades to close.", "close_all"); return; }
   await db.update(activeTrades).set({ closed: true }).where(eq(activeTrades.closed, false));
-  await sendTelegram(`<b>🔴 Manually closed ${openTrades.length} trade(s)</b>\nAll positions marked closed.`, "close_all");
+  await sendTelegram(`<b>🔴 Manually closed ${openTrades.length} trade(s)</b>\nAll positions closed.`, "close_all");
 }
 
-async function handleConfirmedCommand(input: number | null) {
+async function handleConfirmedCommand(index: number | null) {
   const setups = await db.select().from(activeSetups).orderBy(desc(activeSetups.detectedAt));
-
-  if (setups.length === 0) {
-    await sendTelegram("No pending setups to confirm.", "confirmed");
-    return;
-  }
-
-  let setupToConfirm;
-
-  if (input !== null) {
-    // Check if input matches the display ID (last 2 digits of DB ID)
-    setupToConfirm = setups.find(s => (s.id % 100) === input);
-    
-    // Fallback to array index if no ID match (for backward compatibility)
-    if (!setupToConfirm && input > 0 && input <= setups.length) {
-      setupToConfirm = setups[input - 1];
+  if (setups.length === 0) { await sendTelegram("No pending setups.", "confirmed"); return; }
+  let setupToConfirm: any = null;
+  if (index !== null) { setupToConfirm = setups[index]; }
+  else {
+    if (lastSignaledSetupId) {
+      setupToConfirm = setups.find(s => s.id === lastSignaledSetupId);
+      if (Date.now() - lastSignaledAt > 5 * 60 * 1000) setupToConfirm = setups[0];
     }
-  } else {
-    // Default to the most recent setup
-    setupToConfirm = setups[0];
+    if (!setupToConfirm) setupToConfirm = setups[0];
   }
-
-  if (!setupToConfirm) {
-    const errorMsg = input !== null 
-      ? `No setup found with ID or position ${String(input).padStart(2, '0')}.`
-      : "No pending setups to confirm.";
-    await sendTelegram(errorMsg, "confirmed");
-    return;
-  }
-
+  if (!setupToConfirm) { await sendTelegram("No setup found.", "confirmed"); return; }
   await confirmSetup(setupToConfirm.id);
 }
 
 async function confirmSetup(setupId: number) {
   const [setup] = await db.select().from(activeSetups).where(eq(activeSetups.id, setupId)).limit(1);
   if (!setup) return;
-
   const tradeId = `trade_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-
   await db.insert(activeTrades).values({
-    tradeId,
-    direction: setup.direction,
-    zone: setup.zoneLabel,
-    zoneTier: setup.zoneTier,
-    entry: setup.entry,
-    sl: setup.sl,
-    slDistance: setup.slDistance,
-    tp1: setup.tp1,
-    tp2: setup.tp2,
-    tp3: setup.tp3,
+    tradeId, direction: setup.direction, zone: setup.zoneLabel, zoneTier: setup.zoneTier,
+    entry: setup.entry, sl: setup.sl, slDistance: setup.slDistance,
+    tp1: setup.tp1, tp2: setup.tp2, tp3: setup.tp3,
   });
-
   await db.delete(activeSetups).where(eq(activeSetups.id, setupId));
-
   const arrow = setup.direction.includes("LONG") ? "🟢" : "🔴";
-  const msg = `<b>✅ TRADE CONFIRMED — Monitoring Active</b>
+  const msg = `<b>✅ SMC TRADE CONFIRMED</b>
 ${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}
 Zone: ${setup.zoneLabel}
 SL: $${setup.sl.toFixed(2)} | TP1: $${setup.tp1.toFixed(2)} | TP2: $${setup.tp2.toFixed(2)} | TP3: $${setup.tp3.toFixed(2)}
-I will alert you when TP/SL is hit.`;
-
+Monitoring active.`;
   await sendTelegram(msg, "confirmed");
 }
 
-// ── Auto-Scan Loop (15-minute interval) ────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTO-SCAN & MONITORING LOOPS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 let autoScanInterval: ReturnType<typeof setInterval> | null = null;
-const AUTO_SCAN_INTERVAL_MS = 30 * 1000; // 30 seconds for faster signal detection
+const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting auto-scan loop (30-second interval)");
-
-  // Run an immediate scan on startup
+  console.log("[Bot] Starting SMC auto-scan (3-min) — 4H Trend + 30M Order Blocks");
   (async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) await scanZones(priceData);
-    } catch (e) {
-      console.error("[Bot] Auto-scan startup error:", e);
-    }
+      if (priceData) await scanSMCZones(priceData);
+    } catch (e) { console.error("[Bot] Auto-scan startup error:", e); }
   })();
-
   autoScanInterval = setInterval(async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) await scanZones(priceData);
-    } catch (e) {
-      console.error("[Bot] Auto-scan error:", e);
-    }
+      if (priceData) await scanSMCZones(priceData);
+    } catch (e) { console.error("[Bot] Auto-scan error:", e); }
   }, AUTO_SCAN_INTERVAL_MS);
 }
 
 export function stopAutoScan() {
-  if (autoScanInterval) {
-    clearInterval(autoScanInterval);
-    autoScanInterval = null;
-    console.log("[Bot] Stopped auto-scan loop");
-  }
+  if (autoScanInterval) { clearInterval(autoScanInterval); autoScanInterval = null; console.log("[Bot] Stopped auto-scan"); }
 }
 
-// ── Fast Trade Monitoring Loop ──────────────────────────────────────────────
 let tradeMonitorInterval: ReturnType<typeof setInterval> | null = null;
-
 export function startTradeMonitoring() {
   if (tradeMonitorInterval) return;
-  console.log("[Bot] Starting fast trade monitor (5s interval)");
+  console.log("[Bot] Starting trade monitor (5s)");
   tradeMonitorInterval = setInterval(async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) {
-        await trackActiveTrades(priceData.price);
-      }
-    } catch (e) {
-      console.log("[Bot] Trade monitor error:", e);
-    }
+      if (priceData) { await trackActiveTrades(priceData.price); await expireStaleSetups(priceData.price); }
+    } catch (e) { console.log("[Bot] Trade monitor error:", e); }
   }, 5000);
 }
 
 export function stopTradeMonitoring() {
-  if (tradeMonitorInterval) {
-    clearInterval(tradeMonitorInterval);
-    tradeMonitorInterval = null;
-    console.log("[Bot] Stopped fast trade monitor");
-  }
+  if (tradeMonitorInterval) { clearInterval(tradeMonitorInterval); tradeMonitorInterval = null; console.log("[Bot] Stopped trade monitor"); }
 }
 
-// ── Telegram Polling Loop ────────────────────────────────────────────────────
 let pollingInterval: ReturnType<typeof setInterval> | null = null;
-
 export function startTelegramPolling() {
   if (pollingInterval) return;
-  console.log("[Bot] Starting Telegram polling loop (30s interval)");
-  pollingInterval = setInterval(async () => {
-    await handleTelegramUpdates();
-  }, POLL_INTERVAL);
+  console.log("[Bot] Starting Telegram polling (30s)");
+  pollingInterval = setInterval(async () => { await handleTelegramUpdates(); }, POLL_INTERVAL);
 }
 
 export function stopTelegramPolling() {
-  if (pollingInterval) {
-    clearInterval(pollingInterval);
-    pollingInterval = null;
-    console.log("[Bot] Stopped Telegram polling loop");
-  }
+  if (pollingInterval) { clearInterval(pollingInterval); pollingInterval = null; console.log("[Bot] Stopped Telegram polling"); }
 }
