@@ -718,12 +718,16 @@ export async function scanSMCZones(
     return { setupFound: false, count: 0, reason: "30M neutral — no clear swing structure" };
   }
 
-  // ─── STEP 3.5: 1H Confluence Filter (NEW) ───
+  // ─── STEP 3.5: 1H Confluence Filter ───
+  // Block only if 1H is actively OPPOSITE to 30M bias. Neutral 1H is allowed (30M leads).
   const candles1h = await getRecent1HourCandles();
-  if (candles1h.length < 8) return { setupFound: false, count: 0, reason: "1H candles insufficient for confluence" };
-  const structure1h = analyze1HStructure(candles1h);
-  if (structure1h.trend === "neutral") return { setupFound: false, count: 0, reason: "1H neutral — no clear structure" };
-  if (structure1h.trend !== activeBias) return { setupFound: false, count: 0, reason: `1H/30M mismatch (1H: ${structure1h.trend}, 30M: ${activeBias})` };
+  const structure1h = candles1h.length >= 8
+    ? analyze1HStructure(candles1h)
+    : { trend: "neutral" as const, lastSwingHigh: 0, lastSwingLow: 0 };
+  const oppositeOf = (b: "bullish" | "bearish") => b === "bullish" ? "bearish" : "bullish";
+  if (structure1h.trend === oppositeOf(activeBias)) {
+    return { setupFound: false, count: 0, reason: `1H opposing bias (1H: ${structure1h.trend}, 30M: ${activeBias})` };
+  }
 
   // ─── STEP 4: 30M Order Blocks filtered by active bias ───
   const orderBlocks = detectOrderBlocks(candles30m);
@@ -745,13 +749,14 @@ export async function scanSMCZones(
 
   if (choch.occurred) { confMode = "CHoCH"; confQuality = "A"; }
   else {
-    // B-tier: Momentum — 3 consecutive directional moves with a big candle
-    if (priceHistory.length >= 3) {
-      const recent = priceHistory.slice(-3);
-      const moves = [recent[1]!.price - recent[0]!.price, recent[2]!.price - recent[1]!.price];
+    // B-tier: Momentum — 3 consecutive 30M candles closing in bias direction, at least one with body > 2pts
+    if (candles30m.length >= 3) {
+      const recent3 = candles30m.slice(-3);
       const isBullishBias = activeBias === "bullish";
-      const allDir = isBullishBias ? moves.every(m => m > 0) : moves.every(m => m < 0);
-      const hasBig = moves.some(m => Math.abs(m) > 4);
+      const allDir = isBullishBias
+        ? recent3.every(c => c.close > c.open)
+        : recent3.every(c => c.close < c.open);
+      const hasBig = recent3.some(c => Math.abs(c.close - c.open) > 2);
       if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
     }
   }
