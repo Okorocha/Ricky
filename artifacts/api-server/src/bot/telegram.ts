@@ -955,15 +955,21 @@ export async function handleTelegramUpdates() {
   try {
     const resp = await fetch(`https://api.telegram.org/bot${TOKEN}/getUpdates?offset=${lastUpdateId + 1}`, { signal: AbortSignal.timeout(8000) });
     if (resp.status !== 200) return;
-    const j = await resp.json() as { result?: Array<{ update_id: number; message?: { text?: string; message_id?: number } }> };
+    const j = await resp.json() as { result?: Array<{ update_id: number; message?: { chat?: { id: number }; text?: string; message_id?: number } }> };
     const updates = j?.result ?? [];
     for (const u of updates) {
       if (u.update_id <= lastUpdateId) continue;
       lastUpdateId = u.update_id;
-      const text = u.message?.text?.trim();
-      if (!text) continue;
 
-      const isConfirm = text.includes("IN") && (text.startsWith("IN") || text.includes("I'M IN") || text.includes("IM IN"));
+      // Only handle messages from the configured chat
+      const chatId = u.message?.chat?.id;
+      if (String(chatId) !== String(CHAT_ID)) continue;
+
+      const raw = u.message?.text?.trim();
+      if (!raw) continue;
+      const text = raw.toUpperCase();
+
+      const isConfirm = (text === "IN" || text.startsWith("IN ") || text.includes("I'M IN") || text.includes("IM IN"));
 
       if (text === "ALIVE") {
         const data = await fetchGoldData();
