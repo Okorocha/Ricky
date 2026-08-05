@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "evhTaxjs-ixMJQK7FatG1"
+uri = "file://backtest/reports/xauusd-annual-backtest-2026-08-05.txt"
+type = "text"
+title = "XAUUSD 1-Year Backtest Report"
+description = "Annual trade-count and performance report with monthly and daily breakdowns."
+
+[[outputs]]
+id = "lpqy6ZiuSto0yCN7uMVrP"
+uri = "file://backtest/reports/xauusd-annual-backtest-2026-08-05.csv"
+type = "table"
+title = "XAUUSD Daily Trade Counts CSV"
+description = "Daily trade counts from the annual backtest."

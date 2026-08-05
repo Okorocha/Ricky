@@ -1,3 +1,4 @@
 - [tRPC + esbuild externals](trpc-esbuild-externals.md) — @trpc/* and superjson must stay in external[] in build.mjs or the api-server build fails.
 - [Ricky project setup](ricky-setup.md) — XAU/USD trading bot: ricky (React dashboard at /), api-server (Express+tRPC+Telegram bot at /api). TELEGRAM_TOKEN and TELEGRAM_CHAT_ID set as shared env vars.
 - [GitHub sync](github-sync.md) — the Ricky GitHub repo has a separate history from the starter scaffold; preserve a local backup before syncing unrelated histories.
+- [Annual backtest data](annual-backtest-data.md) — Yahoo Finance limits 30-minute history, so annual runs use 1-hour GC=F bars as a proxy unless Twelve Data history is available.
