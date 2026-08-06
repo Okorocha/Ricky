@@ -956,12 +956,9 @@ async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; 
   const today = new Date(); today.setHours(0, 0, 0, 0);
   try { allTodayTrades = await db.select().from(activeTrades).where(gte(activeTrades.confirmedAt, today)); } catch {}
 
-  const directionCounts = new Map<string, number>();
   const blockedZoneKeys = new Set<string>();
 
   for (const t of openTrades) {
-    const dir = t.direction.includes("LONG") ? "LONG" : "SHORT";
-    directionCounts.set(dir, (directionCounts.get(dir) || 0) + 1);
     blockedZoneKeys.add(t.zone);
   }
   for (const s of pendingSetups) { blockedZoneKeys.add(s.zoneKey); blockedZoneKeys.add(s.zoneLabel); }
@@ -1010,8 +1007,8 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: Tight | Structural SL | 30M+1H | CHoCH/Momentum Only
-Scan: Every 3 min`, "alive"
+Mode: 30M OB + 5M Confirmation | 1H Confluence | Structural SL
+Scan: Every minute`, "alive"
         );
         continue;
       }
@@ -1034,7 +1031,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Structural SL | 30M+1H`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M OB + 5M Confirmation | 1H Confluence`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1136,7 +1133,7 @@ export function stopTradeMonitoring() {
 let pollingInterval: ReturnType<typeof setInterval> | null = null;
 export function startTelegramPolling() {
   if (pollingInterval) return;
-  console.log("[Bot] Starting Telegram polling (30s)");
+  console.log("[Bot] Starting Telegram polling (15s)");
   pollingInterval = setInterval(async () => { await handleTelegramUpdates(); }, POLL_INTERVAL);
 }
 

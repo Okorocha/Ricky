@@ -10,8 +10,9 @@ description: XAU/USD trading bot — architecture, stack, and key env vars
 
 ## Telegram bot
 - Starts automatically when TELEGRAM_TOKEN is set (in `src/index.ts`)
-- Three loops: startAutoScan (15 min), startTradeMonitoring (5s), startTelegramPolling (30s)
+- Three loops: 1-minute auto-scan, 5-second trade monitoring, and 15-second Telegram polling
 - TELEGRAM_TOKEN and TELEGRAM_CHAT_ID are set as shared environment variables
+- TWELVE_DATA_API_KEY is stored as a secret for 30M, 5M, and 1H candle data
 
 ## Key packages
 - Frontend: @trpc/client, @trpc/react-query, superjson, wouter, sonner, @tanstack/react-query
