@@ -33,7 +33,7 @@ const GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes between scan batches
 
 // ── DB-level cooldown check ───────────────────────────────────────────────────
 const breachNotifiedSetups = new Set<number>();
-const SETUP_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours for day trading setups
+const SETUP_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours — OBs take time to retrace
 
 async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
   try {
@@ -500,28 +500,20 @@ function calculateSMCSL(
   ob: OrderBlock,
   structure30m: Structure30M
 ): { sl: number; slDistance: number } {
-  const isLong = direction === "LONG";
-  let structureSL: number;
+  // SMC-style: SL placed at OB invalidation + spread buffer.
+  // If the OB gets invalidated, the setup is wrong — get out.
+  // No arbitrary minimum/maximum. The OB either holds or it doesn't.
+  const BUFFER = 8.0;  // widened from 5pt — Standard account spread needs more room
 
-  if (isLong) {
-    const slBelowOB = ob.low - 2.0;
-    const slBelowSwing = structure30m.lastSwingLow - 1.0;
-    structureSL = Math.max(slBelowOB, slBelowSwing - 5.0);
+  if (direction === "LONG") {
+    const sl = ob.low - BUFFER; // Below the OB candle's low wick
+    const slDist = Math.abs(entry - sl);
+    return { sl: Math.round(sl * 100) / 100, slDistance: Math.round(slDist * 100) / 100 };
   } else {
-    const slAboveOB = ob.high + 2.0;
-    const slAboveSwing = structure30m.lastSwingHigh + 1.0;
-    structureSL = Math.min(slAboveOB, slAboveSwing + 5.0);
+    const sl = ob.high + BUFFER; // Above the OB candle's high wick
+    const slDist = Math.abs(entry - sl);
+    return { sl: Math.round(sl * 100) / 100, slDistance: Math.round(slDist * 100) / 100 };
   }
-
-  const slDist = Math.abs(entry - structureSL);
-  // Standard account spread-aware SL: add 5pt buffer to absorb 20-35 pip spread wicks
-  // Min 30pts ensures SL isn't eaten by spread alone, max 50pts keeps R:R viable
-  const spreadBuffer = 5.0;
-  const baseDist = Math.max(25, Math.min(slDist, 45)) + spreadBuffer;
-  const finalDist = Math.max(30, Math.min(baseDist, 50));
-  const finalSL = isLong ? entry - finalDist : entry + finalDist;
-
-  return { sl: Math.round(finalSL * 100) / 100, slDistance: Math.round(finalDist * 100) / 100 };
 }
 
 function calculateSMCTP(
@@ -571,7 +563,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 5M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>30M OB + 5M Confirmation | 1H Confluence | Structural SL</b>`;
+<b>30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -756,36 +748,23 @@ export async function scanSMCZones(
   if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // ─── STEP 5: 5M CHoCH + Momentum Confirmation ───
+  // ─── STEP 5: 5M CHoCH Confirmation ───
   const candles5m = await getRecent5MinCandles();
   const choch5m = detectCHoCH(candles5m);
   const range30m = detect30MRange(candles30m);
 
-  // Confirmation must agree with the 30M bias. The 30M chart defines the
-  // order-block context; the 5M chart provides the execution trigger.
+  // The 30M chart defines the order-block context; the 5M chart provides
+  // the execution trigger. Confirmation must agree with the 30M bias.
   let confMode = "none";
-  let confQuality: "A" | "B" = "B";
+  let confQuality: "A" | "B" = "A";
 
   if (choch5m.occurred && ((activeBias === "bullish" && choch5m.direction === "bullish") || (activeBias === "bearish" && choch5m.direction === "bearish"))) {
     confMode = "CHoCH";
     confQuality = "A";
   }
-  else {
-    // B-tier: Momentum — 3 consecutive 5M candles closing in bias direction,
-    // with at least one meaningful body.
-    if (candles5m.length >= 3) {
-      const recent3 = candles5m.slice(-3);
-      const isBullishBias = activeBias === "bullish";
-      const allDir = isBullishBias
-        ? recent3.every(c => c.close > c.open)
-        : recent3.every(c => c.close < c.open);
-      const hasBig = recent3.some(c => Math.abs(c.close - c.open) > 0.75);
-      if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
-    }
-  }
 
   if (confMode === "none") {
-    return { setupFound: false, count: 0, reason: `No 5M confirmation (CHoCH + Momentum only)` };
+    return { setupFound: false, count: 0, reason: "No 5M CHoCH confirmation" };
   }
 
   // ─── STEP 6: Evaluate each valid OB ───
@@ -798,11 +777,8 @@ export async function scanSMCZones(
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     const entryPrice = ob.price;
-    // Wider tolerance allows nearby, valid 30M blocks to remain eligible while
-    // still rejecting blocks that are too far away for an actionable entry.
-    const minDist = confQuality === "B" ? 3 : 2;
-    const maxDist = confQuality === "B" ? 35 : 50;
-    if (ob.distance > maxDist || ob.distance < minDist) continue;
+    // Wider range allows valid 30M blocks to remain eligible for limit entries.
+    if (ob.distance < 2 || ob.distance > 50) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
     const isLong = ob.direction === "LONG";
@@ -924,7 +900,7 @@ export async function expireStaleSetups(price: number) {
       const tooOld = ageMs > SETUP_MAX_AGE_MS;
 
       if (slBreached || tooOld) {
-        const reason = slBreached ? "Price hit SL" : "Setup expired (2h)";
+        const reason = slBreached ? "Price hit SL" : "Setup expired (4h)";
         const arrow = isLong ? "🟢" : "🔴";
         const gracePeriod = 5 * 60 * 1000;
         const isWithinGrace = slBreached && ageMs < gracePeriod;
@@ -1007,7 +983,8 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: 30M OB + 5M Confirmation | 1H Confluence | Structural SL
+Mode: 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)
+Expiry: 4 hours | Limit Entries
 Scan: Every minute`, "alive"
         );
         continue;
@@ -1031,7 +1008,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M OB + 5M Confirmation | 1H Confluence`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1095,7 +1072,7 @@ const AUTO_SCAN_INTERVAL_MS = 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (1-min) — 30M OB + 5M Confirmation, 1H Confluence, Structural SL");
+  console.log("[Bot] Starting SMC auto-scan (1-min) — 30M OB + 5M CHoCH Confirmation, 1H Confluence, 8pt Structural SL");
   (async () => {
     try {
       const priceData = await fetchGoldData();
