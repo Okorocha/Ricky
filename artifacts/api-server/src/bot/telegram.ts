@@ -4,7 +4,7 @@ import { eq, and, desc, gte } from "drizzle-orm";
 
 const TOKEN = process.env.TELEGRAM_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const POLL_INTERVAL = 30000; // 30 seconds
+const POLL_INTERVAL = 15000; // 15 seconds
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_API_KEY || "";
 
 // ── Candle interface ──────────────────────────────────────────────────────────
@@ -25,15 +25,15 @@ export interface ScanResult {
 
 // ── In-memory signal cooldown per zone ────────────────────────────────────────
 const zoneCooldowns = new Map<string, number>();
-const ZONE_COOLDOWN_MS = 15 * 60 * 1000; // 15 minutes for day trading
+const ZONE_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes for day trading
 
 // ── Global signal cooldown ────────────────────────────────────────────────────
 let lastGlobalSignalTime = 0;
-const GLOBAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes between signals
+const GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes between scan batches
 
 // ── DB-level cooldown check ───────────────────────────────────────────────────
 const breachNotifiedSetups = new Set<number>();
-const SETUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour for day trading setups
+const SETUP_MAX_AGE_MS = 2 * 60 * 60 * 1000; // 2 hours for day trading setups
 
 async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
   try {
@@ -97,6 +97,9 @@ async function fetchTwelveDataOHLC(interval: string, outputsize: number): Promis
 let thirtyMinCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
 const THIRTY_MIN_CACHE_TTL = 2 * 60 * 1000;
 
+let fiveMinCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
+const FIVE_MIN_CACHE_TTL = 60 * 1000;
+
 let fourHourCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
 let oneHourCandleCache: { candles: OHLCCandle[]; fetchedAt: number } | null = null;
 const ONE_HOUR_CACHE_TTL = 4 * 60 * 60 * 1000;
@@ -127,6 +130,20 @@ export async function getRecent30MinCandles(): Promise<OHLCCandle[]> {
     return candles;
   } catch {
     return thirtyMinCandleCache?.candles ?? [];
+  }
+}
+
+export async function getRecent5MinCandles(): Promise<OHLCCandle[]> {
+  const now = Date.now();
+  if (fiveMinCandleCache && now - fiveMinCandleCache.fetchedAt < FIVE_MIN_CACHE_TTL) {
+    return fiveMinCandleCache.candles;
+  }
+  try {
+    const candles = await fetchTwelveDataOHLC("5min", 288);
+    fiveMinCandleCache = { candles, fetchedAt: now };
+    return candles;
+  } catch {
+    return fiveMinCandleCache?.candles ?? [];
   }
 }
 
@@ -316,7 +333,7 @@ function detectOrderBlocks(candles: OHLCCandle[]): OrderBlock[] {
   return blocks;
 }
 
-// ─── CHoCH Detection on 30M ──────────────────────────────────────────────────
+// ─── CHoCH Detection ──────────────────────────────────────────────────────────
 interface CHoCHResult {
   occurred: boolean;
   direction: "bullish" | "bearish";
@@ -551,10 +568,10 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 
 <b>Trend:</b> ${biasLabel}
 <b>Entry:</b> ${obType} Order Block
-<b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
+<b>Confirmation:</b> 5M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum | Structural SL</b>`;
+<b>30M OB + 5M Confirmation | 1H Confluence | Structural SL</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -739,42 +756,52 @@ export async function scanSMCZones(
   if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // ─── STEP 5: CHoCH + Momentum Only (Tight Confirmation) ───
-  const choch = detectCHoCH(candles30m);
+  // ─── STEP 5: 5M CHoCH + Momentum Confirmation ───
+  const candles5m = await getRecent5MinCandles();
+  const choch5m = detectCHoCH(candles5m);
   const range30m = detect30MRange(candles30m);
 
-  // ─── Tight Confirmation: CHoCH (A) or Momentum (B) only ───
+  // Confirmation must agree with the 30M bias. The 30M chart defines the
+  // order-block context; the 5M chart provides the execution trigger.
   let confMode = "none";
   let confQuality: "A" | "B" = "B";
 
-  if (choch.occurred) { confMode = "CHoCH"; confQuality = "A"; }
+  if (choch5m.occurred && ((activeBias === "bullish" && choch5m.direction === "bullish") || (activeBias === "bearish" && choch5m.direction === "bearish"))) {
+    confMode = "CHoCH";
+    confQuality = "A";
+  }
   else {
-    // B-tier: Momentum — 3 consecutive 30M candles closing in bias direction, at least one with body > 2pts
-    if (candles30m.length >= 3) {
-      const recent3 = candles30m.slice(-3);
+    // B-tier: Momentum — 3 consecutive 5M candles closing in bias direction,
+    // with at least one meaningful body.
+    if (candles5m.length >= 3) {
+      const recent3 = candles5m.slice(-3);
       const isBullishBias = activeBias === "bullish";
       const allDir = isBullishBias
         ? recent3.every(c => c.close > c.open)
         : recent3.every(c => c.close < c.open);
-      const hasBig = recent3.some(c => Math.abs(c.close - c.open) > 2);
+      const hasBig = recent3.some(c => Math.abs(c.close - c.open) > 0.75);
       if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
     }
   }
 
   if (confMode === "none") {
-    return { setupFound: false, count: 0, reason: `No confirmation (CHoCH + Momentum only)` };
+    return { setupFound: false, count: 0, reason: `No 5M confirmation (CHoCH + Momentum only)` };
   }
 
   // ─── STEP 6: Evaluate each valid OB ───
+  const MAX_SETUPS_PER_SCAN = 3;
+  let createdCount = 0;
   for (const ob of validOBs) {
+    if (createdCount >= MAX_SETUPS_PER_SCAN) break;
     const zoneKey = `smc_${ob.direction.toLowerCase()}_${ob.index}`;
     if (blockedZoneKeys.has(zoneKey)) continue;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     const entryPrice = ob.price;
-    // Quality-based distance: Momentum (B) requires tighter OB (5–20), CHoCH (A) allows wider (2–30)
-    const minDist = confQuality === "B" ? 5 : 2;
-    const maxDist = confQuality === "B" ? 20 : 30;
+    // Wider tolerance allows nearby, valid 30M blocks to remain eligible while
+    // still rejecting blocks that are too far away for an actionable entry.
+    const minDist = confQuality === "B" ? 3 : 2;
+    const maxDist = confQuality === "B" ? 35 : 50;
     if (ob.distance > maxDist || ob.distance < minDist) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
@@ -785,8 +812,6 @@ export async function scanSMCZones(
     // Spread-aware proximity: require more distance from SL to account for spread wicks
     const proximityToSL = isLong ? (price - sl) : (sl - price);
     if (proximityToSL < (slDistance * 0.25)) continue;
-
-    if (blockedDirections.has(ob.direction)) continue;
 
     // Calculate TPs
     let { tp1, tp2, tp3 } = calculateSMCTP(entryPrice, ob.direction, slDistance, structure4h);
@@ -806,7 +831,7 @@ export async function scanSMCZones(
     const obType = ob.direction === "LONG" ? "Bullish" : "Bearish";
     const msg = formatSMCSignal(
       ob.direction, entryPrice, sl, slDistance, tp1, tp2, tp3,
-      price, activeBias, obType, choch.occurred, "none", session, priority, biasSource
+      price, activeBias, obType, confMode === "CHoCH", "none", session, priority, biasSource
     );
 
     try {
@@ -816,7 +841,7 @@ export async function scanSMCZones(
         zoneTier: "major", entry: entryPrice, sl, slDistance,
         tp1, tp2, tp3, currentPrice: price, session,
         priority: "A+",
-        reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | CHoCH: ${choch.occurred} | 1H Confluence: ${structure1h.trend}`,
+         reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | 5M ${confMode} | 1H Confluence: ${structure1h.trend}`,
         status: "AT_LEVEL", zoneKey,
       });
       await db.insert(activeSetups).values({
@@ -831,16 +856,19 @@ export async function scanSMCZones(
     }
 
       await sendTelegram(msg, `smc_signal_${confMode}`);
-    lastGlobalSignalTime = Date.now();
+      createdCount++;
+  }
 
+  if (createdCount > 0) {
+    lastGlobalSignalTime = Date.now();
     return {
       setupFound: true,
-      count: 1,
-      reason: `SMC: ${obType} OB at $${entryPrice.toFixed(2)} | ${biasSource} ${biasLabel}`,
+      count: createdCount,
+      reason: `SMC: ${createdCount} ${activeBias} 30M OB setup(s) | 5M ${confMode} | ${biasSource} ${biasLabel}`,
     };
   }
 
-  return { setupFound: false, count: 0, reason: `No OBs in range | ${biasSource}: ${biasLabel}` };
+  return { setupFound: false, count: 0, reason: `No eligible OBs in range | ${biasSource}: ${biasLabel}` };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -896,7 +924,7 @@ export async function expireStaleSetups(price: number) {
       const tooOld = ageMs > SETUP_MAX_AGE_MS;
 
       if (slBreached || tooOld) {
-        const reason = slBreached ? "Price hit SL" : "Setup expired (1h)";
+        const reason = slBreached ? "Price hit SL" : "Setup expired (2h)";
         const arrow = isLong ? "🟢" : "🔴";
         const gracePeriod = 5 * 60 * 1000;
         const isWithinGrace = slBreached && ageMs < gracePeriod;
@@ -938,8 +966,9 @@ async function getTradeConstraints(): Promise<{ blockedDirections: Set<string>; 
   }
   for (const s of pendingSetups) { blockedZoneKeys.add(s.zoneKey); blockedZoneKeys.add(s.zoneLabel); }
 
+  // Same-direction stacking is intentional: each distinct 30M order block may
+  // produce its own setup. Duplicate zones remain blocked above.
   const blockedDirections = new Set<string>();
-  for (const [dir, count] of directionCounts.entries()) { if (count >= 2) blockedDirections.add(dir); }
 
   return { blockedDirections, blockedZoneKeys } as const;
 }
@@ -1065,11 +1094,11 @@ Monitoring active.`;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let autoScanInterval: ReturnType<typeof setInterval> | null = null;
-const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
+const AUTO_SCAN_INTERVAL_MS = 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH+Momentum, 1H Confluence, Structural SL)");
+  console.log("[Bot] Starting SMC auto-scan (1-min) — 30M OB + 5M Confirmation, 1H Confluence, Structural SL");
   (async () => {
     try {
       const priceData = await fetchGoldData();
