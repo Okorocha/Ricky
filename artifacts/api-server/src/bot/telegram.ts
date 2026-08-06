@@ -33,7 +33,8 @@ const GLOBAL_COOLDOWN_MS = 10 * 60 * 1000; // 10 minutes between scan batches
 
 // ── DB-level cooldown check ───────────────────────────────────────────────────
 const breachNotifiedSetups = new Set<number>();
-const SETUP_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours — OBs take time to retrace
+const SETUP_MAX_AGE_MS = 5 * 60 * 1000; // Market-entry signals are valid for one 5M candle
+const MAX_MARKET_ENTRY_OB_DISTANCE = 15; // Match the market-execution backtest
 
 async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
   try {
@@ -559,11 +560,12 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>TP3:</b> $${tp3.toFixed(2)} (4R)
 
 <b>Trend:</b> ${biasLabel}
-<b>Entry:</b> ${obType} Order Block
+<b>Entry:</b> Market Execution
+<b>Context:</b> ${obType} Order Block (30M)
 <b>Confirmation:</b> 5M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)</b>`;
+<b>Market Entry | 30M OB + 5M CHoCH | 1H Confluence | Structural SL (8pt)</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -776,9 +778,12 @@ export async function scanSMCZones(
     if (blockedZoneKeys.has(zoneKey)) continue;
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
-    const entryPrice = ob.price;
-    // Wider range allows valid 30M blocks to remain eligible for limit entries.
-    if (ob.distance < 2 || ob.distance > 50) continue;
+    // The order block remains the setup context and structural invalidation point.
+    // Entry is taken at the current executable market price instead of waiting
+    // for a retrace to the OB.
+    const entryPrice = ob.direction === "LONG" ? priceData.ask : priceData.bid;
+    const marketEntryDistance = Math.abs(entryPrice - ob.price);
+    if (marketEntryDistance < 2 || marketEntryDistance > MAX_MARKET_ENTRY_OB_DISTANCE) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
     const isLong = ob.direction === "LONG";
@@ -818,13 +823,13 @@ export async function scanSMCZones(
         tp1, tp2, tp3, currentPrice: price, session,
         priority: "A+",
          reason: `SMC: ${obType} OB + ${biasSource} ${biasLabel} | 5M ${confMode} | 1H Confluence: ${structure1h.trend}`,
-        status: "AT_LEVEL", zoneKey,
+        status: "MARKET", zoneKey,
       });
       await db.insert(activeSetups).values({
         zoneKey, direction: ob.direction,
         zoneLabel: `${obType} OB (30M)`, zoneTier: "major",
         entry: entryPrice, sl, slDistance, tp1, tp2, tp3,
-        currentPrice: price, status: "AT_LEVEL", session,
+        currentPrice: entryPrice, status: "MARKET", session,
         priority: "A+", detectedAt: new Date(),
       });
     } catch (err) {
@@ -840,7 +845,7 @@ export async function scanSMCZones(
     return {
       setupFound: true,
       count: createdCount,
-      reason: `SMC: ${createdCount} ${activeBias} 30M OB setup(s) | 5M ${confMode} | ${biasSource} ${biasLabel}`,
+      reason: `SMC: ${createdCount} ${activeBias} market setup(s) | 30M OB + 5M ${confMode} | ${biasSource} ${biasLabel}`,
     };
   }
 
@@ -900,7 +905,7 @@ export async function expireStaleSetups(price: number) {
       const tooOld = ageMs > SETUP_MAX_AGE_MS;
 
       if (slBreached || tooOld) {
-        const reason = slBreached ? "Price hit SL" : "Setup expired (4h)";
+        const reason = slBreached ? "Price hit SL" : "Market-entry signal expired (5m)";
         const arrow = isLong ? "🟢" : "🔴";
         const gracePeriod = 5 * 60 * 1000;
         const isWithinGrace = slBreached && ageMs < gracePeriod;
@@ -913,7 +918,7 @@ export async function expireStaleSetups(price: number) {
             : `<b>⚠️ SMC SETUP CANCELLED</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nReason: ${reason}`;
           await sendTelegram(cancelMsg, "setup_cancelled");
         } else if (slBreached && isWithinGrace && !breachNotifiedSetups.has(setup.id)) {
-          await sendTelegram(`<b>⚠️ SMC SETUP STOPPED OUT</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nSL: $${setup.sl.toFixed(2)}\n<b>If you already entered, reply "IN" to track.</b>`, "setup_warning");
+          await sendTelegram(`<b>⚠️ SMC MARKET SIGNAL STOPPED OUT</b>\n${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}\nSL: $${setup.sl.toFixed(2)}\n<b>If you entered at market, reply "IN" to track.</b>`, "setup_warning");
           breachNotifiedSetups.add(setup.id);
         }
       }
@@ -983,8 +988,8 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)
-Expiry: 4 hours | Limit Entries
+Mode: Market Entry | 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)
+Expiry: 5 minutes | Manual Confirmation
 Scan: Every minute`, "alive"
         );
         continue;
@@ -1047,18 +1052,42 @@ async function handleConfirmedCommand(index: number | null) {
 async function confirmSetup(setupId: number) {
   const [setup] = await db.select().from(activeSetups).where(eq(activeSetups.id, setupId)).limit(1);
   if (!setup) return;
+  const ageMs = Date.now() - new Date(setup.detectedAt).getTime();
+  if (ageMs > SETUP_MAX_AGE_MS) {
+    await db.delete(activeSetups).where(eq(activeSetups.id, setupId));
+    await sendTelegram("<b>⚠️ MARKET SIGNAL EXPIRED</b>\nThis setup was older than 5 minutes. Wait for the next signal.", "setup_expired");
+    return;
+  }
+
+  // Use a fresh quote so a manual confirmation tracks the actual market
+  // execution price rather than the price in a stale Telegram message.
+  const livePrice = await fetchGoldData();
+  if (!livePrice) {
+    await sendTelegram("<b>⚠️ MARKET ENTRY NOT CONFIRMED</b>\nLive price is unavailable. Try again on the next signal.", "confirmed");
+    return;
+  }
+  const entry = setup.direction.includes("LONG") ? livePrice.ask : livePrice.bid;
+  const slDistance = Math.abs(entry - setup.sl);
+  if (slDistance <= 0) {
+    await sendTelegram("<b>⚠️ MARKET ENTRY NOT CONFIRMED</b>\nInvalid live risk distance. Wait for the next signal.", "confirmed");
+    return;
+  }
+  const { tp1, tp2, tp3 } = calculateSMCTP(entry, setup.direction as "LONG" | "SHORT", slDistance, {
+    trend: "neutral", lastSwingHigh: 0, lastSwingLow: 0, structure: "choppy",
+    swingPoints: [], isRanging: false, rangeWidth: 0,
+  });
   const tradeId = `trade_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   await db.insert(activeTrades).values({
     tradeId, direction: setup.direction, zone: setup.zoneLabel, zoneTier: setup.zoneTier,
-    entry: setup.entry, sl: setup.sl, slDistance: setup.slDistance,
-    tp1: setup.tp1, tp2: setup.tp2, tp3: setup.tp3,
+    entry, sl: setup.sl, slDistance,
+    tp1, tp2, tp3,
   });
   await db.delete(activeSetups).where(eq(activeSetups.id, setupId));
   const arrow = setup.direction.includes("LONG") ? "🟢" : "🔴";
   const msg = `<b>✅ SMC TRADE CONFIRMED</b>
-${arrow} ${setup.direction} @ $${setup.entry.toFixed(2)}
+${arrow} ${setup.direction} MARKET @ $${entry.toFixed(2)}
 Zone: ${setup.zoneLabel}
-SL: $${setup.sl.toFixed(2)} | TP1: $${setup.tp1.toFixed(2)} | TP2: $${setup.tp2.toFixed(2)} | TP3: $${setup.tp3.toFixed(2)}
+SL: $${setup.sl.toFixed(2)} | TP1: $${tp1.toFixed(2)} | TP2: $${tp2.toFixed(2)} | TP3: $${tp3.toFixed(2)}
 Monitoring active.`;
   await sendTelegram(msg, "confirmed");
 }
@@ -1072,7 +1101,7 @@ const AUTO_SCAN_INTERVAL_MS = 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (1-min) — 30M OB + 5M CHoCH Confirmation, 1H Confluence, 8pt Structural SL");
+  console.log("[Bot] Starting SMC auto-scan (1-min) — Market Entry, 30M OB + 5M CHoCH, 1H Confluence, 8pt Structural SL");
   (async () => {
     try {
       const priceData = await fetchGoldData();
