@@ -33,7 +33,7 @@ const GLOBAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes between signals
 
 // ── DB-level cooldown check ───────────────────────────────────────────────────
 const breachNotifiedSetups = new Set<number>();
-const SETUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 hour for day trading setups
+const SETUP_MAX_AGE_MS = 4 * 60 * 60 * 1000; // 4 hours — OBs take time to retrace
 
 async function isZoneOnCooldownDB(zoneKey: string): Promise<boolean> {
   try {
@@ -486,7 +486,7 @@ function calculateSMCSL(
   // SMC-style: SL placed at OB invalidation + spread buffer.
   // If the OB gets invalidated, the setup is wrong — get out.
   // No arbitrary minimum/maximum. The OB either holds or it doesn't.
-  const BUFFER = 5.0; // 5-point buffer for spread/wick protection
+  const BUFFER = 8.0;  // widened from 5pt — Standard account spread needs more room
 
   if (direction === "LONG") {
     const sl = ob.low - BUFFER; // Below the OB candle's low wick
@@ -546,7 +546,7 @@ ${arrow} <b>${action}</b> @ $${entry.toFixed(2)}
 <b>Confirmation:</b> 30M CHoCH${chochText}${sweepText}
 <b>Session:</b> ${session} (${priority})
 
-<b>Tight Mode: 30M+1H Confluence | CHoCH/Momentum | Structural SL</b>`;
+<b>Tight Mode: 30M+1H | CHoCH Only | Structural SL (8pt) | 4h Expiry</b>`;
 }
 
 export function formatTPHit(trade: { direction: string; entry: number; tp1: number; tp2: number; tp3: number }, tpLevel: string, currentPrice: number): string {
@@ -731,30 +731,18 @@ export async function scanSMCZones(
   if (validOBs.length === 0) return { setupFound: false, count: 0, reason: `No OBs in ${activeBias} direction (${biasSource} bias)` };
   validOBs.sort((a, b) => a.distance - b.distance);
 
-  // ─── STEP 5: CHoCH + Momentum Only (Tight Confirmation) ───
+  // ─── STEP 5: CHoCH Only (Momentum dropped — 20% WR in backtest) ───
   const choch = detectCHoCH(candles30m);
   const range30m = detect30MRange(candles30m);
 
-  // ─── Tight Confirmation: CHoCH (A) or Momentum (B) only ───
+  // Only accept CHoCH confirmation (backtest: 33% WR vs Momentum 20% WR)
   let confMode = "none";
-  let confQuality: "A" | "B" = "B";
+  let confQuality: "A" | "B" = "A";
 
   if (choch.occurred) { confMode = "CHoCH"; confQuality = "A"; }
-  else {
-    // B-tier: Momentum — 3 consecutive 30M candles closing in bias direction, at least one with body > 2pts
-    if (candles30m.length >= 3) {
-      const recent3 = candles30m.slice(-3);
-      const isBullishBias = activeBias === "bullish";
-      const allDir = isBullishBias
-        ? recent3.every(c => c.close > c.open)
-        : recent3.every(c => c.close < c.open);
-      const hasBig = recent3.some(c => Math.abs(c.close - c.open) > 2);
-      if (allDir && hasBig) { confMode = "momentum"; confQuality = "B"; }
-    }
-  }
 
   if (confMode === "none") {
-    return { setupFound: false, count: 0, reason: `No confirmation (CHoCH + Momentum only)` };
+    return { setupFound: false, count: 0, reason: `No CHoCH confirmation` };
   }
 
   // ─── STEP 6: Evaluate each valid OB ───
@@ -764,10 +752,8 @@ export async function scanSMCZones(
     if (isZoneOnCooldown(zoneKey) || await isZoneOnCooldownDB(zoneKey)) continue;
 
     const entryPrice = ob.price;
-    // Quality-based distance: Momentum (B) requires tighter OB (5–20), CHoCH (A) allows wider (2–30)
-    const minDist = confQuality === "B" ? 5 : 2;
-    const maxDist = confQuality === "B" ? 20 : 30;
-    if (ob.distance > maxDist || ob.distance < minDist) continue;
+    // CHoCH-only: allow OBs 2–30pts away (wider range for limit entries)
+    if (ob.distance < 2 || ob.distance > 30) continue;
 
     const { sl, slDistance } = calculateSMCSL(entryPrice, ob.direction, ob, structure30m);
     const isLong = ob.direction === "LONG";
@@ -888,7 +874,7 @@ export async function expireStaleSetups(price: number) {
       const tooOld = ageMs > SETUP_MAX_AGE_MS;
 
       if (slBreached || tooOld) {
-        const reason = slBreached ? "Price hit SL" : "Setup expired (1h)";
+        const reason = slBreached ? "Price hit SL" : "Setup expired (4h)";
         const arrow = isLong ? "🟢" : "🔴";
         const gracePeriod = 5 * 60 * 1000;
         const isWithinGrace = slBreached && ageMs < gracePeriod;
@@ -973,7 +959,8 @@ export async function handleTelegramUpdates() {
 SMC Day Trading Mode
 XAU/USD: $${price.toFixed(2)}
 ${status}
-Mode: Tight | Structural SL | 30M+1H | CHoCH/Momentum Only
+Mode: Tight | Structural SL (8pt buffer) | 30M+1H | CHoCH Only
+Expiry: 4 hours | Limit Entries
 Scan: Every 3 min`, "alive"
         );
         continue;
@@ -997,7 +984,7 @@ async function handleStatusCommand() {
   const data = await fetchGoldData();
   const price = data?.price || 0;
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Structural SL | 30M+1H`, "status"); return; }
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: Tight | Structural SL (8pt) | 30M+1H | CHoCH Only`, "status"); return; }
   let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
@@ -1061,7 +1048,7 @@ const AUTO_SCAN_INTERVAL_MS = 3 * 60 * 1000;
 
 export function startAutoScan() {
   if (autoScanInterval) return;
-  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH+Momentum, 1H Confluence, Structural SL)");
+  console.log("[Bot] Starting SMC auto-scan (3-min) — Tight Mode (CHoCH Only, 1H Confluence, 8pt SL, 4h Expiry)");
   (async () => {
     try {
       const priceData = await fetchGoldData();
