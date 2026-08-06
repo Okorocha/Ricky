@@ -483,28 +483,20 @@ function calculateSMCSL(
   ob: OrderBlock,
   structure30m: Structure30M
 ): { sl: number; slDistance: number } {
-  const isLong = direction === "LONG";
-  let structureSL: number;
+  // SMC-style: SL placed at OB invalidation + spread buffer.
+  // If the OB gets invalidated, the setup is wrong — get out.
+  // No arbitrary minimum/maximum. The OB either holds or it doesn't.
+  const BUFFER = 5.0; // 5-point buffer for spread/wick protection
 
-  if (isLong) {
-    const slBelowOB = ob.low - 2.0;
-    const slBelowSwing = structure30m.lastSwingLow - 1.0;
-    structureSL = Math.max(slBelowOB, slBelowSwing - 5.0);
+  if (direction === "LONG") {
+    const sl = ob.low - BUFFER; // Below the OB candle's low wick
+    const slDist = Math.abs(entry - sl);
+    return { sl: Math.round(sl * 100) / 100, slDistance: Math.round(slDist * 100) / 100 };
   } else {
-    const slAboveOB = ob.high + 2.0;
-    const slAboveSwing = structure30m.lastSwingHigh + 1.0;
-    structureSL = Math.min(slAboveOB, slAboveSwing + 5.0);
+    const sl = ob.high + BUFFER; // Above the OB candle's high wick
+    const slDist = Math.abs(entry - sl);
+    return { sl: Math.round(sl * 100) / 100, slDistance: Math.round(slDist * 100) / 100 };
   }
-
-  const slDist = Math.abs(entry - structureSL);
-  // Standard account spread-aware SL: add 5pt buffer to absorb 20-35 pip spread wicks
-  // Min 30pts ensures SL isn't eaten by spread alone, max 50pts keeps R:R viable
-  const spreadBuffer = 5.0;
-  const baseDist = Math.max(25, Math.min(slDist, 45)) + spreadBuffer;
-  const finalDist = Math.max(30, Math.min(baseDist, 50));
-  const finalSL = isLong ? entry - finalDist : entry + finalDist;
-
-  return { sl: Math.round(finalSL * 100) / 100, slDistance: Math.round(finalDist * 100) / 100 };
 }
 
 function calculateSMCTP(
