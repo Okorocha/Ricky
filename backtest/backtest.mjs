@@ -13,6 +13,7 @@
  */
 
 import { createRequire } from "module";
+import fs from "fs";
 const require = createRequire(import.meta.url);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,8 +170,20 @@ function detectCHoCH(candles) {
   }
 
   const last = recent[recent.length - 1];
-  if (last.close > swingHigh && swingHighIdx >= 0) return { occurred: true, direction: "bullish" };
-  if (last.close < swingLow  && swingLowIdx  >= 0) return { occurred: true, direction: "bearish" };
+  if (last.close > swingHigh && swingHighIdx >= 0) {
+    let confirmationLevel = Infinity;
+    for (let i = swingLowIdx >= 0 ? swingLowIdx : 0; i < recent.length; i++) {
+      if (recent[i].low < confirmationLevel) confirmationLevel = recent[i].low;
+    }
+    return { occurred: true, direction: "bullish", confirmationLevel };
+  }
+  if (last.close < swingLow && swingLowIdx >= 0) {
+    let confirmationLevel = -Infinity;
+    for (let i = swingHighIdx >= 0 ? swingHighIdx : 0; i < recent.length; i++) {
+      if (recent[i].high > confirmationLevel) confirmationLevel = recent[i].high;
+    }
+    return { occurred: true, direction: "bearish", confirmationLevel };
+  }
   return { occurred: false };
 }
 
@@ -215,20 +228,34 @@ function detectOrderBlocks(candles, currentPrice) {
 // ─────────────────────────────────────────────────────────────────────────────
 // SL / TP
 // ─────────────────────────────────────────────────────────────────────────────
-function calcSL(entry, direction, ob, structure30m) {
+function calcSL(entry, direction, ob, structure30m, choch) {
   const isLong = direction === "LONG";
   let sl;
-  if (isLong) {
-    const slBelowOB    = ob.low  - 2.0;
-    const slBelowSwing = structure30m.lastSwingLow - 1.0;
-    sl = Math.max(slBelowOB, slBelowSwing - 5.0);
+  const buffer = 2.0; // buffer in points
+
+  if (choch && choch.occurred && choch.confirmationLevel != null && Number.isFinite(choch.confirmationLevel)) {
+    // Dynamic SL placed at CHoCH confirmation low/high with buffer
+    if (isLong) {
+      sl = choch.confirmationLevel - buffer;
+    } else {
+      sl = choch.confirmationLevel + buffer;
+    }
   } else {
-    const slAboveOB    = ob.high + 2.0;
-    const slAboveSwing = structure30m.lastSwingHigh + 1.0;
-    sl = Math.min(slAboveOB, slAboveSwing + 5.0);
+    // Fallback if not CHoCH confirmed
+    if (isLong) {
+      const slBelowOB    = ob.low  - buffer;
+      const slBelowSwing = structure30m.lastSwingLow - 1.0;
+      sl = Math.max(slBelowOB, slBelowSwing - 3.0);
+    } else {
+      const slAboveOB    = ob.high + buffer;
+      const slAboveSwing = structure30m.lastSwingHigh + 1.0;
+      sl = Math.min(slAboveOB, slAboveSwing + 3.0);
+    }
   }
-  const slDist   = Math.abs(entry - sl);
-  const finalDist = Math.max(30, Math.min(Math.max(25, Math.min(slDist, 45)) + 5, 50));
+
+  const slDist = Math.abs(entry - sl);
+  // Allow dynamic SL distance with reasonable constraints (min 10 pts, max 80 pts)
+  const finalDist = Math.max(10, Math.min(slDist, 80));
   return { sl: isLong ? entry - finalDist : entry + finalDist, slDistance: finalDist };
 }
 
@@ -310,7 +337,7 @@ function scanBar(idx, candles30m, candles1h, state) {
     const maxDist = confQuality === "B" ? 20 : 30;
     if (ob.distance > maxDist || ob.distance < minDist) continue;
 
-    const { sl, slDistance } = calcSL(ob.price, ob.direction, ob, s30);
+    const { sl, slDistance } = calcSL(ob.price, ob.direction, ob, s30, confMode === "CHoCH" ? choch : null);
     const isLong = ob.direction === "LONG";
 
     // SL already breached?
@@ -495,6 +522,16 @@ async function main() {
   const trades = signals.map(s => simulateTrade(s, candles30m));
 
   printReport(trades, scanCount);
+  exportCSV(trades);
+}
+
+function exportCSV(trades) {
+  const header = "id,date,direction,confMode,entry,sl,tp1,tp2,tp3,outcome,R,barsHeld\n";
+  const rows = trades.map((t, i) => 
+    `"${i+1}","${t.date}","${t.direction}","${t.confMode}",${t.entry},${t.sl},${t.tp1},${t.tp2},${t.tp3},"${t.outcome}",${t.R},${t.barsHeld}`
+  ).join("\n");
+  fs.writeFileSync("/home/ubuntu/ricky_repo/backtest/reports/dynamic_sl_trades.csv", header + rows);
+  console.log("Detailed trade metrics exported to /home/ubuntu/ricky_repo/backtest/reports/dynamic_sl_trades.csv");
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
