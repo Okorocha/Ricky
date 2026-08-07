@@ -4,7 +4,7 @@ import { eq, and, desc, gte } from "drizzle-orm";
 
 const TOKEN = process.env.TELEGRAM_TOKEN || "";
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID || "";
-const POLL_INTERVAL = 15000; // 15 seconds
+const POLL_INTERVAL = 8000; // 8 seconds (commands are not held up by slow price fetches)
 const TWELVE_DATA_KEY = process.env.TWELVE_DATA_API_KEY || "";
 
 // ── Candle interface ──────────────────────────────────────────────────────────
@@ -72,6 +72,21 @@ const PRICE_HISTORY_MAX = 20;
 function recordPriceTick(price: number, spread: number): void {
   priceHistory.push({ price, spread, ts: Date.now() });
   if (priceHistory.length > PRICE_HISTORY_MAX) priceHistory.shift();
+}
+
+// ── Last-known price fallback ─────────────────────────────────────────────────
+const LAST_KNOWN_PRICE_STALE_MS = 10 * 60 * 1000; // warn when tick is older than this
+
+/** Returns the most recent recorded tick, or null if nothing has been recorded. */
+export function getLastKnownPrice(): PriceTick | null {
+  if (priceHistory.length === 0) return null;
+  return priceHistory[priceHistory.length - 1]!;
+}
+
+export function isPriceTickStale(): boolean {
+  const last = getLastKnownPrice();
+  if (!last) return true;
+  return Date.now() - last.ts > LAST_KNOWN_PRICE_STALE_MS;
 }
 
 // ── Twelve Data OHLC Fetching ─────────────────────────────────────────────────
@@ -654,24 +669,36 @@ export async function fetchGoldData(): Promise<{ price: number; bid: number; ask
     if (!bid || !ask) throw new Error("bad prices");
     return { price: (bid + ask) / 2, bid, ask, spread: ask - bid, source: "Swissquote" };
   };
-  const tryGoldprice = async (): Promise<PriceData> => {
-    const resp = await fetch("https://data-asg.goldprice.org/dbXRates/USD", { signal: AbortSignal.timeout(4000) });
-    if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json() as { items?: Array<{ xauPrice: string }> };
-    const price = parseFloat(j?.items?.[0]?.xauPrice ?? "");
+  const tryGoldpriceDev = async (): Promise<PriceData> => {
+    const resp = await fetch("https://api.goldprice.dev/v1/prices?symbol=XAU-USD-SPOT", { signal: AbortSignal.timeout(8000) });
+    if (resp.status !== 200) throw new Error(`non-200 ${resp.status}`);
+    const j = await resp.json() as { symbols?: Array<{ price?: string; bid?: string; ask?: string }> };
+    const s = j?.symbols?.[0];
+    const price = parseFloat(s?.price ?? "");
     if (!price) throw new Error("no price");
-    return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "goldprice.org" };
+    const bid = parseFloat(s?.bid ?? "");
+    const ask = parseFloat(s?.ask ?? "");
+    if (!bid || !ask) throw new Error("no bid/ask");
+    return { price, bid, ask, spread: ask - bid, source: "goldprice.dev" };
   };
-  const tryFrankfurter = async (): Promise<PriceData> => {
-    const resp = await fetch("https://api.frankfurter.app/latest?from=XAU&to=USD", { signal: AbortSignal.timeout(4000) });
-    if (resp.status !== 200) throw new Error("non-200");
-    const j = await resp.json() as { rates?: { USD?: number } };
-    const price = parseFloat(String(j?.rates?.USD ?? ""));
-    if (!price) throw new Error("no price");
-    return { price, bid: price, ask: price + 0.5, spread: 0.5, source: "frankfurter" };
+  const tryFrankfurterDev = async (): Promise<PriceData> => {
+    const resp = await fetch("https://api.frankfurter.dev/v2/rate/XAU/USD", { signal: AbortSignal.timeout(8000) });
+    if (resp.status !== 200) throw new Error(`non-200 ${resp.status}`);
+    const j = await resp.json() as { rate?: number; date?: string };
+    const rate = j?.rate;
+    if (!rate) throw new Error("no rate");
+    // Sanity check: the v2 /rate/XAU/USD endpoint returns USD per 1 XAU (the XAU/USD
+    // spot price, e.g. ~4300). A stale or inverted quote would land outside this band.
+    if (rate < 100 || rate > 10000) throw new Error(`suspicious rate ${rate}`);
+    return { price: rate, bid: rate, ask: rate + 0.5, spread: 0.5, source: `frankfurter.dev (${j.date ?? "?"})` };
   };
-  const result = await Promise.any([trySwissquote(), tryGoldprice(), tryFrankfurter()]).catch(() => null);
-  if (result) { recordPriceTick(result.price, result.spread); return result; }
+
+  // Try primary sources concurrently (best of three wins), then retry once on failure.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await Promise.any([trySwissquote(), tryGoldpriceDev(), tryFrankfurterDev()]).catch(() => null);
+    if (result) { recordPriceTick(result.price, result.spread); return result; }
+    if (attempt === 0) await new Promise(r => setTimeout(r, 800));
+  }
   return null;
 }
 
@@ -968,42 +995,53 @@ export async function handleTelegramUpdates() {
       if (u.update_id <= lastUpdateId) continue;
       lastUpdateId = u.update_id;
 
-      // Only handle messages from the configured chat
-      const chatId = u.message?.chat?.id;
-      if (String(chatId) !== String(CHAT_ID)) continue;
+      // Fire-and-forget command handling: each update is processed in its own
+      // promise so a slow handler (e.g. ALIVE waiting on price providers) never
+      // delays the handling of subsequent updates in this poll window.
+      void (async () => {
+        // Only handle messages from the configured chat
+        const chatId = u.message?.chat?.id;
+        if (String(chatId) !== String(CHAT_ID)) return;
 
-      const raw = u.message?.text?.trim();
-      if (!raw) continue;
-      const text = raw.toUpperCase();
+        const raw = u.message?.text?.trim();
+        if (!raw) return;
+        const text = raw.toUpperCase();
 
-      const isConfirm = (text === "IN" || text.startsWith("IN ") || text.includes("I'M IN") || text.includes("IM IN"));
+        const isConfirm = (text === "IN" || text.startsWith("IN ") || text.includes("I'M IN") || text.includes("IM IN"));
 
-      if (text === "ALIVE") {
-        const data = await fetchGoldData();
-        const price = data?.price || 0;
-        const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
-        const status = openTrades.length > 0 ? `${openTrades.length} active trade(s)` : "No active trades";
-        await sendTelegram(
+        if (text === "ALIVE") {
+          // Fetch price concurrently so the ALIVE reply is never held up by slow
+          // price providers; fall back to the last known tick if it fails.
+          const pricePromise = fetchGoldData().catch(() => null);
+          const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
+          const status = openTrades.length > 0 ? `${openTrades.length} active trade(s)` : "No active trades";
+          const data = await pricePromise;
+          const tick = data ?? getLastKnownPrice();
+          const price = tick?.price || 0;
+          const stale = tick && !data && isPriceTickStale();
+          const priceLine = stale ? `XAU/USD: $${price.toFixed(2)} ⚠️ stale (last known)` : `XAU/USD: $${price.toFixed(2)}`;
+          await sendTelegram(
           `<b>✅ Ricky Bot is ALIVE</b>
 SMC Day Trading Mode
-XAU/USD: $${price.toFixed(2)}
+${priceLine}
 ${status}
 Mode: Market Entry | 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)
 Expiry: 5 minutes | Manual Confirmation
 Scan: Every minute`, "alive"
-        );
-        continue;
-      }
+          );
+          return;
+        }
 
-      if (text === "STATUS") { await handleStatusCommand(); continue; }
-      if (text === "CLOSE ALL") { await handleCloseAllCommand(); continue; }
+        if (text === "STATUS") { await handleStatusCommand(); return; }
+        if (text === "CLOSE ALL") { await handleCloseAllCommand(); return; }
 
-      if (isConfirm) {
-        const match = text.match(/\d+/);
-        const index = match ? parseInt(match[0]) - 1 : null;
-        await handleConfirmedCommand(index);
-        continue;
-      }
+        if (isConfirm) {
+          const match = text.match(/\d+/);
+          const index = match ? parseInt(match[0]) - 1 : null;
+          await handleConfirmedCommand(index);
+          return;
+        }
+      })();
     }
   } catch (err) { console.error("[Bot] handleTelegramUpdates error:", err); }
 }
@@ -1011,10 +1049,13 @@ Scan: Every minute`, "alive"
 async function handleStatusCommand() {
   const openTrades = await db.select().from(activeTrades).where(eq(activeTrades.closed, false));
   const data = await fetchGoldData();
-  const price = data?.price || 0;
+  const tick = data ?? getLastKnownPrice();
+  const price = tick?.price || 0;
+  const stale = tick && !data && isPriceTickStale();
+  const staleNote = stale ? "\n⚠️ Live price down — showing last known price (stale)" : "";
   if (price <= 0) { await sendTelegram(`<b>⚠️ Price unavailable</b>\nOpen: ${openTrades.length}`, "status"); return; }
-  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}\nMode: 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)`, "status"); return; }
-  let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}\n`;
+  if (openTrades.length === 0) { await sendTelegram(`<b>📊 SMC Status</b>\nNo active trades\nXAU/USD: $${price.toFixed(2)}${staleNote}\nMode: 30M OB + 5M CHoCH Confirmation | 1H Confluence | Structural SL (8pt)`, "status"); return; }
+  let statusMsg = `<b>📊 Active SMC Trades (${openTrades.length})</b>\nXAU/USD: $${price.toFixed(2)}${staleNote}\n`;
   for (const trade of openTrades) {
     const isLong = trade.direction.includes("LONG");
     const arrow = isLong ? "🟢" : "🔴";
@@ -1061,9 +1102,20 @@ async function confirmSetup(setupId: number) {
 
   // Use a fresh quote so a manual confirmation tracks the actual market
   // execution price rather than the price in a stale Telegram message.
-  const livePrice = await fetchGoldData();
+  // Retry a few times over a short window to ride out a transient outage
+  // before giving up, so a slow-but-working provider doesn't cost a trade.
+  let livePrice = await fetchGoldData();
   if (!livePrice) {
-    await sendTelegram("<b>⚠️ MARKET ENTRY NOT CONFIRMED</b>\nLive price is unavailable. Try again on the next signal.", "confirmed");
+    for (let i = 0; i < 3; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      livePrice = await fetchGoldData();
+      if (livePrice) break;
+    }
+  }
+  if (!livePrice) {
+    const lastTick = getLastKnownPrice();
+    const priceNote = lastTick ? `\nLast known price: $${lastTick.price.toFixed(2)}` : "";
+    await sendTelegram(`<b>⚠️ MARKET ENTRY NOT CONFIRMED</b>\nLive price is unavailable after retries.${priceNote}\nTry again in 1 minute.`, "confirmed");
     return;
   }
   const entry = setup.direction.includes("LONG") ? livePrice.ask : livePrice.bid;
@@ -1127,7 +1179,10 @@ export function startTradeMonitoring() {
   tradeMonitorInterval = setInterval(async () => {
     try {
       const priceData = await fetchGoldData();
-      if (priceData) { await trackActiveTrades(priceData.price); await expireStaleSetups(priceData.price); }
+      // Use last known tick when the live fetch fails: skipping TP/SL monitoring
+      // entirely would leave open trades unprotected during price outages.
+      const tick = priceData ?? getLastKnownPrice();
+      if (tick) { await trackActiveTrades(tick.price); await expireStaleSetups(tick.price); }
     } catch (e) { console.log("[Bot] Trade monitor error:", e); }
   }, 5000);
 }

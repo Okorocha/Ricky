@@ -29,6 +29,11 @@ app.listen(port, (err) => {
     startAutoScan();
     startTradeMonitoring();
     startTelegramPolling();
+    // Pre-warm the price cache at startup so last-known-price fallbacks and
+    // command replies have a price immediately, even if providers are slow.
+    void import("./bot/telegram").then(m => m.fetchGoldData()).then(data => {
+      logger.info(data ? `Price cache warmed: XAU/USD $${data.price.toFixed(2)} (${data.source})` : "Price cache warm-up failed — will use last known price fallbacks");
+    }).catch(() => {});
     logger.info("Telegram bot, auto-scan, and trade monitoring started");
   } else {
     logger.warn("TELEGRAM_TOKEN not set — bot and trade monitoring disabled");
